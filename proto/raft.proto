@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package konsen;
 
-option go_package = "github.com/lizhaoliu/konsen";
+option go_package = ".;konsen";
 
 enum Role {
   FOLLOWER = 0;
@@ -34,4 +34,10 @@ message RequestVoteReq {
 message RequestVoteResp {
   int64 term = 1;
   bool vote_granted = 2;
+}
+
+message LogEntry {
+  int64 term = 1;
+  int64 index = 2;
+  bytes data = 3;
 }
