@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package konsen;
+
+option go_package = "github.com/lizhaoliu/konsen";
+
+enum Role {
+  FOLLOWER = 0;
+  CANDIDATE = 1;
+  LEADER = 2;
+}
+
+message AppendEntriesReq {
+  int64 term = 1;
+  string leader_id = 2;
+  int64 prev_log_index = 3;
+  int64 prev_log_term = 4;
+  repeated bytes entries = 5;
+  int64 leader_commit = 6;
+}
+
+message AppendEntriesResp {
+  int64 term = 1;
+  bool success = 2;
+}
+
+message RequestVoteReq {
+  int64 term = 1;
+  string candidate_id = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term = 4;
+}
+
+message RequestVoteResp {
+  int64 term = 1;
+  bool vote_granted = 2;
+}
