@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package konsen;
+
+option go_package = ".;konsen";
+
+message Node {
+  string endpoint = 1;  // Represents a "host:port" endpoint.
+}
+
+message Cluster {
+  repeated Node nodes = 1;
+}

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -18,45 +19,54 @@ const (
 
 type PersistentState interface {
 	// Latest term server has seen (initialized to 0 on first boot, increases monotonically).
-	GetCurrentTerm() int64
+	GetCurrentTerm() (uint64, error)
 
 	//
-	SetCurrentTerm(term int64)
+	SetCurrentTerm(term uint64) error
 
 	// Candidate ID that received a vote in current term, empty/blank if none.
-	GetVotedFor() string
+	GetVotedFor() (string, error)
 
 	//
-	SetVotedFor(candidateID string)
+	SetVotedFor(candidateID string) error
 
 	//
-	GetLogEntry(logIndex int64) konsen.LogEntry
+	GetLog(logIndex uint64) (*konsen.Log, error)
 
 	//
-	AppendLogEntry(logEntry konsen.LogEntry) error
+	AppendLog(log *konsen.Log) error
+
+	//
+	DeleteLogs(minLogIndex uint64) error
 }
+
+type electionTimeout struct{}
 
 type StateMachine struct {
 	msgCh           chan interface{} // Message channel.
 	stopCh          chan struct{}    // Signals to stop the state machine.
 	timerGateCh     chan struct{}    // Signals to run next round of election timeout.
-	heartbeatGateCh chan struct{}
-	resetTimerCh    chan struct{} // Signals to reset election timer, in case of receiving AppendEntries or RequestVote.
+	heartbeatGateCh chan struct{}    //
+	resetTimerCh    chan struct{}    // Signals to reset election timer, in case of receiving AppendEntries or RequestVote.
 
 	// Persistent state on all servers.
 	persistentState PersistentState
 
 	// Volatile state on all servers.
-	commitIndex int64       // Index of highest log entry known to be committed.
-	lastApplied int64       // Index of highest log entry applied to state machine.
+	commitIndex uint64      // Index of highest log entry known to be committed.
+	lastApplied uint64      // Index of highest log entry applied to state machine.
 	role        konsen.Role // Current role.
 
 	// Volatile state on leaders (must be reinitialized after election).
-	nextIndex  map[string]int64 // For each server, index of the next log entry to send to that server.
-	matchIndex map[string]int64 // For each server, index of highest log entry known to be replicated on that server.
+	nextIndex  map[string]uint64 // For each server, index of the next log entry to send to that server (initialized to leader last log index + 1).
+	matchIndex map[string]uint64 // For each server, index of highest log entry known to be replicated on that server (initialized to 0, increases monotonically).
 }
 
-func NewStateMachine() *StateMachine {
+func NewStateMachine(cluster *konsen.Cluster) (*StateMachine, error) {
+	if len(cluster.GetNodes())%2 != 1 {
+		return nil, fmt.Errorf("number of nodes in the cluster must be an odd number, got: %d", len(cluster.GetNodes()))
+	}
+
 	sm := &StateMachine{
 		msgCh:           make(chan interface{}),
 		stopCh:          make(chan struct{}),
@@ -68,11 +78,11 @@ func NewStateMachine() *StateMachine {
 		lastApplied: 0,
 		role:        konsen.Role_FOLLOWER,
 
-		nextIndex:  make(map[string]int64),
-		matchIndex: make(map[string]int64),
+		nextIndex:  make(map[string]uint64),
+		matchIndex: make(map[string]uint64),
 	}
 
-	return sm
+	return sm, nil
 }
 
 func (sm *StateMachine) Run(ctx context.Context) error {
@@ -88,7 +98,7 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		for {
-			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3).
+			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
 			if sm.commitIndex > sm.lastApplied {
 				// TODO.
 			}
@@ -104,22 +114,36 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 					sm.resetTimerCh <- struct{}{}
 
 					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
-					if v.Term > sm.persistentState.GetCurrentTerm() {
-						sm.role = konsen.Role_FOLLOWER
-						// TODO.
-					}
+					//if v.Term > sm.persistentState.GetCurrentTerm() {
+					//    sm.persistentState.SetCurrentTerm(v.Term)
+					//    sm.role = konsen.Role_FOLLOWER
+					//}
 
 					sm.timerGateCh <- struct{}{}
 				case konsen.RequestVoteReq:
 					sm.resetTimerCh <- struct{}{}
 
 					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
-					if v.Term > sm.persistentState.GetCurrentTerm() {
-						sm.role = konsen.Role_FOLLOWER
-						// TODO.
-					}
+					//if v.Term > sm.persistentState.GetCurrentTerm() {
+					//    sm.persistentState.SetCurrentTerm(v.Term)
+					//    sm.role = konsen.Role_FOLLOWER
+					//}
 
 					sm.timerGateCh <- struct{}{}
+				case electionTimeout:
+					// If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate.
+					sm.role = konsen.Role_CANDIDATE
+
+					// On conversion to candidate, start election:
+					//  Increment currentTerm.
+					//sm.persistentState.SetCurrentTerm(sm.persistentState.GetCurrentTerm() + 1)
+					//  Vote for self.
+					//  Reset election timer.
+					sm.resetTimerCh <- struct{}{}
+					//  Send RequestVote RPCs to all other servers.
+					//  If votes received from majority of servers: become leader.
+					//  If AppendEntries RPC received from new leader: convert to follower.
+					//  If election timeout elapses: start new election.
 				default:
 					log.Warnf("Unknown message: %v", v)
 				}
@@ -148,7 +172,7 @@ func (sm *StateMachine) startElectionLoop(ctx context.Context, wg *sync.WaitGrou
 			case <-timer.C:
 				// Election timeout happens here.
 				log.Traceln("Election timeout occurs.")
-				// TODO: add election timeout logic.
+				sm.msgCh <- electionTimeout{}
 			}
 		}
 	}()
@@ -179,10 +203,4 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context, wg *sync.WaitGro
 func (sm *StateMachine) nextTimeout() time.Duration {
 	timeout := rand.Int63n(defaultTimeoutSpan) + int64(defaultMinTimeout)
 	return time.Duration(timeout)
-}
-
-func closeTimer(timer *time.Timer) {
-	if !timer.Stop() {
-		<-timer.C
-	}
 }

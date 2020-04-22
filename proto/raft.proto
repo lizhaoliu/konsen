@@ -11,33 +11,33 @@ enum Role {
 }
 
 message AppendEntriesReq {
-  int64 term = 1;
+  uint64 term = 1;
   string leader_id = 2;
-  int64 prev_log_index = 3;
-  int64 prev_log_term = 4;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
   repeated bytes entries = 5;
-  int64 leader_commit = 6;
+  uint64 leader_commit = 6;
 }
 
 message AppendEntriesResp {
-  int64 term = 1;
+  uint64 term = 1;
   bool success = 2;
 }
 
 message RequestVoteReq {
-  int64 term = 1;
+  uint64 term = 1;
   string candidate_id = 2;
-  int64 last_log_index = 3;
-  int64 last_log_term = 4;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
 }
 
 message RequestVoteResp {
-  int64 term = 1;
+  uint64 term = 1;
   bool vote_granted = 2;
 }
 
-message LogEntry {
-  int64 term = 1;
-  int64 index = 2;
+message Log {
+  uint64 index = 1;
+  uint64 term = 2;
   bytes data = 3;
 }
