@@ -41,3 +41,11 @@ message Log {
   uint64 term = 2;
   bytes data = 3;
 }
+
+service Raft {
+  // Sends "AppendEntries" request.
+  rpc AppendEntries(stream AppendEntriesReq) returns (stream AppendEntriesResp) {}
+
+  // Sends "RequestVote" request.
+  rpc RequestVote(stream RequestVoteReq) returns (stream RequestVoteResp) {}
+}

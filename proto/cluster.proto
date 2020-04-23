@@ -9,5 +9,7 @@ message Node {
 }
 
 message Cluster {
-  repeated Node nodes = 1;
+  repeated Node nodes = 1;  // All nodes in this cluster, the number of nodes must be odd.
+  Node local_node = 2;  // Local node, the endpoint must be in the nodes of this cluster.
+  string name = 3;
 }

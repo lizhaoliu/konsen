@@ -12,36 +12,42 @@ import (
 )
 
 const (
-	defaultMinTimeout  = 200 * time.Millisecond
-	defaultTimeoutSpan = int64(400)
-	defaultHeartbeat   = 50 * time.Millisecond
+	defaultMinTimeout  = 500 * time.Millisecond
+	defaultTimeoutSpan = int64(500)
+	defaultHeartbeat   = 40 * time.Millisecond
 )
 
-type PersistentState interface {
-	// Latest term server has seen (initialized to 0 on first boot, increases monotonically).
+// Storage provides an interface for a set of persistent storage operations.
+type Storage interface {
+	// GetCurrentTerm returns the latest term server has seen (initialized to 0 on first boot, increases monotonically).
 	GetCurrentTerm() (uint64, error)
 
-	//
+	// SetCurrentTerm sets the current term.
 	SetCurrentTerm(term uint64) error
 
-	// Candidate ID that received a vote in current term, empty/blank if none.
+	// GetVotedFor returns the candidate ID that received a vote in current term, empty/blank if none.
 	GetVotedFor() (string, error)
 
-	//
+	// SetVotedFor sets the candidate ID that received a vote in current term.
 	SetVotedFor(candidateID string) error
 
-	//
+	// GetLog returns the log entry on given index.
 	GetLog(logIndex uint64) (*konsen.Log, error)
 
-	//
-	AppendLog(log *konsen.Log) error
+	// PutLog stores the given log entry into storage.
+	PutLog(log *konsen.Log) error
+
+	// PutLogs stores the given log entries into storage.
+	PutLogs(logs []*konsen.Log) error
 
 	//
 	DeleteLogs(minLogIndex uint64) error
 }
 
+// electionTimeout represents a signal for election timeout event.
 type electionTimeout struct{}
 
+// StateMachine is the state machine that implements Raft algorithm.
 type StateMachine struct {
 	msgCh           chan interface{} // Message channel.
 	stopCh          chan struct{}    // Signals to stop the state machine.
@@ -49,8 +55,8 @@ type StateMachine struct {
 	heartbeatGateCh chan struct{}    //
 	resetTimerCh    chan struct{}    // Signals to reset election timer, in case of receiving AppendEntries or RequestVote.
 
-	// Persistent state on all servers.
-	persistentState PersistentState
+	// Persistent state storage on all servers.
+	storage Storage
 
 	// Volatile state on all servers.
 	commitIndex uint64      // Index of highest log entry known to be committed.
@@ -114,20 +120,24 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 					sm.resetTimerCh <- struct{}{}
 
 					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
-					//if v.Term > sm.persistentState.GetCurrentTerm() {
-					//    sm.persistentState.SetCurrentTerm(v.Term)
-					//    sm.role = konsen.Role_FOLLOWER
-					//}
+
+					sm.timerGateCh <- struct{}{}
+				case konsen.AppendEntriesResp:
+					sm.resetTimerCh <- struct{}{}
+
+					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 
 					sm.timerGateCh <- struct{}{}
 				case konsen.RequestVoteReq:
 					sm.resetTimerCh <- struct{}{}
 
 					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
-					//if v.Term > sm.persistentState.GetCurrentTerm() {
-					//    sm.persistentState.SetCurrentTerm(v.Term)
-					//    sm.role = konsen.Role_FOLLOWER
-					//}
+
+					sm.timerGateCh <- struct{}{}
+				case konsen.RequestVoteResp:
+					sm.resetTimerCh <- struct{}{}
+
+					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 
 					sm.timerGateCh <- struct{}{}
 				case electionTimeout:
@@ -136,7 +146,7 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 
 					// On conversion to candidate, start election:
 					//  Increment currentTerm.
-					//sm.persistentState.SetCurrentTerm(sm.persistentState.GetCurrentTerm() + 1)
+					//sm.storage.SetCurrentTerm(sm.storage.GetCurrentTerm() + 1)
 					//  Vote for self.
 					//  Reset election timer.
 					sm.resetTimerCh <- struct{}{}
@@ -203,4 +213,9 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context, wg *sync.WaitGro
 func (sm *StateMachine) nextTimeout() time.Duration {
 	timeout := rand.Int63n(defaultTimeoutSpan) + int64(defaultMinTimeout)
 	return time.Duration(timeout)
+}
+
+func (sm *StateMachine) Close() error {
+	close(sm.stopCh)
+	return nil
 }
