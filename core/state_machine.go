@@ -17,39 +17,6 @@ const (
 	defaultHeartbeat   = 40 * time.Millisecond
 )
 
-// Storage provides an interface for a set of persistent storage operations.
-type Storage interface {
-	// GetCurrentTerm returns the latest term server has seen (initialized to 0 on first boot, increases monotonically).
-	GetCurrentTerm() (uint64, error)
-
-	// SetCurrentTerm sets the current term.
-	SetCurrentTerm(term uint64) error
-
-	// GetVotedFor returns the candidate ID that received a vote in current term, empty/blank if none.
-	GetVotedFor() (string, error)
-
-	// SetVotedFor sets the candidate ID that received a vote in current term.
-	SetVotedFor(candidateID string) error
-
-	// GetLog returns the log entry on given index.
-	GetLog(logIndex uint64) (*konsen.Log, error)
-
-	// PutLog stores the given log entry into storage.
-	PutLog(log *konsen.Log) error
-
-	// PutLogs stores the given log entries into storage.
-	PutLogs(logs []*konsen.Log) error
-
-	// FirstLogIndex returns the first(oldest) log entry's index.
-	FirstLogIndex() (uint64, error)
-
-	// LastLogIndex returns the last(newest) log entry's index.
-	LastLogIndex() (uint64, error)
-
-	//
-	DeleteLogs(minLogIndex uint64) error
-}
-
 // electionTimeout represents a signal for election timeout event.
 type electionTimeout struct{}
 
@@ -155,7 +122,7 @@ func (sm *StateMachine) RequestVote(ctx context.Context, req *konsen.RequestVote
 func (sm *StateMachine) checkTerm(term, currentTerm uint64) error {
 	if term > currentTerm {
 		if err := sm.storage.SetCurrentTerm(term); err != nil {
-			return fmt.Errorf("failed  to set current term: %v", err)
+			return fmt.Errorf("failed to set current term: %v", err)
 		}
 		sm.role = konsen.Role_FOLLOWER
 	}
@@ -171,8 +138,8 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 		for {
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
 			for sm.commitIndex > sm.lastApplied {
-				// TODO: apply log[lastApplied].
 				sm.lastApplied++
+				// TODO: apply log[lastApplied].
 			}
 
 			select {
@@ -196,7 +163,7 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 						log.Fatalf("Failed to get current term: %v", err)
 					}
 					if err := sm.checkTerm(term, currentTerm); err != nil {
-						log.Errorf("%v", err)
+						log.Fatalf("%v", err)
 					}
 
 					// 1. Reply false if term < currentTerm.
@@ -209,11 +176,11 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 					}
 
 					// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
-					logEntry, err := sm.storage.GetLog(v.req.GetPrevLogIndex())
+					prevLog, err := sm.storage.GetLog(v.req.GetPrevLogIndex())
 					if err != nil {
-						log.Fatalf("Failed to get log: %v", err)
+						log.Fatalf("Failed to get log at index %d: %v", v.req.GetPrevLogIndex(), err)
 					}
-					if logEntry.GetTerm() != v.req.GetPrevLogTerm() {
+					if prevLog.GetTerm() != v.req.GetPrevLogTerm() {
 						v.ch <- &konsen.AppendEntriesResp{
 							Term:    currentTerm,
 							Success: false,
@@ -222,14 +189,39 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 					}
 
 					// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it.
-					// TODO.
+					for _, newLog := range v.req.GetEntries() {
+						smLog, err := sm.storage.GetLog(newLog.GetIndex())
+						if err != nil {
+							log.Fatalf("Failed to get log at index %d: %v", newLog.GetIndex(), err)
+						}
+						if smLog.GetTerm() != newLog.GetTerm() {
+							if err := sm.storage.DeleteLogs(newLog.GetIndex()); err != nil {
+								log.Fatalf("Failed to delete logs with min index %d: %v", newLog.GetIndex(), err)
+							}
+						}
+					}
 
 					// 4. Append any new entries not already in the log.
-					// TODO.
+					if err := sm.storage.PutLogs(v.req.GetEntries()); err != nil {
+						log.Fatalf("Failed to store logs: %v", err)
+					}
 
 					// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
 					if v.req.GetLeaderCommit() > sm.commitIndex {
-						// TODO.
+						sm.commitIndex = v.req.GetLeaderCommit()
+						lastLogIndex, err := sm.storage.LastLogIndex()
+						if err != nil {
+							log.Fatalf("Failed to get index of the last log: %v", err)
+						}
+						if sm.commitIndex < lastLogIndex {
+							sm.commitIndex = lastLogIndex
+						}
+					}
+
+					// Reply with success.
+					v.ch <- &konsen.AppendEntriesResp{
+						Term:    currentTerm,
+						Success: true,
 					}
 
 					sm.timerGateCh <- struct{}{}
@@ -237,36 +229,87 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 					sm.resetTimerCh <- struct{}{}
 
 					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
+					term := v.req.GetTerm()
+					currentTerm, err := sm.storage.GetCurrentTerm()
+					if err != nil {
+						log.Fatalf("Failed to get current term: %v", err)
+					}
+					if err := sm.checkTerm(term, currentTerm); err != nil {
+						log.Fatalf("%v", err)
+					}
+
+					// 1. Reply false if term < currentTerm.
+					if term < currentTerm {
+						v.ch <- &konsen.RequestVoteResp{
+							Term:        currentTerm,
+							VoteGranted: false,
+						}
+						continue
+					}
+
+					// 2. If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote.
+					votedFor, err := sm.storage.GetVotedFor()
+					if err != nil {
+						log.Fatalf("Failed to get votedFor: %v", err)
+					}
+					if votedFor == "" {
+						// TODO: grant vote and reply.
+					}
+					// TODO: if candidate’s log is at least as up-to-date as receiver’s log, grant vote.
 
 					sm.timerGateCh <- struct{}{}
 				case konsen.RequestVoteReq:
 					sm.resetTimerCh <- struct{}{}
 
 					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
+					term := v.GetTerm()
+					currentTerm, err := sm.storage.GetCurrentTerm()
+					if err != nil {
+						log.Fatalf("Failed to get current term: %v", err)
+					}
+					if err := sm.checkTerm(term, currentTerm); err != nil {
+						log.Fatalf("%v", err)
+					}
 
 					sm.timerGateCh <- struct{}{}
 				case konsen.RequestVoteResp:
 					sm.resetTimerCh <- struct{}{}
 
 					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
+					term := v.GetTerm()
+					currentTerm, err := sm.storage.GetCurrentTerm()
+					if err != nil {
+						log.Fatalf("Failed to get current term: %v", err)
+					}
+					if err := sm.checkTerm(term, currentTerm); err != nil {
+						log.Fatalf("%v", err)
+					}
 
 					sm.timerGateCh <- struct{}{}
 				case electionTimeout:
 					// If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate.
 					sm.role = konsen.Role_CANDIDATE
 
+					currentTerm, err := sm.storage.GetCurrentTerm()
+					if err != nil {
+						log.Fatalf("Failed to get current term: %v", err)
+					}
 					// On conversion to candidate, start election:
-					//  Increment currentTerm.
-					//sm.storage.SetCurrentTerm(sm.storage.GetCurrentTerm() + 1)
-					//  Vote for self.
-					//  Reset election timer.
+					// 1. Increment currentTerm.
+					currentTerm++
+					if err := sm.storage.SetCurrentTerm(currentTerm); err != nil {
+						log.Fatalf("Failed to set current term to %d: %v", currentTerm, err)
+					}
+					// 2. TODO: Vote for self.
+					// 3. Reset election timer.
 					sm.resetTimerCh <- struct{}{}
-					//  Send RequestVote RPCs to all other servers.
-					//  If votes received from majority of servers: become leader.
-					//  If AppendEntries RPC received from new leader: convert to follower.
-					//  If election timeout elapses: start new election.
+					// 4. TODO: Send RequestVote RPCs to all other servers.
+
+					// 5. TODO: If votes received from majority of servers: become leader.
+					// 6. TODO: If AppendEntries RPC received from new leader: convert to follower.
+					// 7. TODO: If election timeout elapses: start new election.
 				default:
-					log.Warnf("Unknown message: %v", v)
+					log.Fatalf("Unrecognized message: %v", v)
 				}
 			}
 		}

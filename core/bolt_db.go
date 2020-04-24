@@ -122,6 +122,10 @@ func (b *BoltDB) PutLog(log *konsen.Log) error {
 }
 
 func (b *BoltDB) PutLogs(logs []*konsen.Log) error {
+	if len(logs) == 0 {
+		return nil
+	}
+
 	return b.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(logsBucketName)
 		for _, log := range logs {

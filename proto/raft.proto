@@ -10,36 +10,36 @@ enum Role {
   LEADER = 2;
 }
 
+message Log {
+  uint64 index = 1; // Index of the log entry.
+  uint64 term = 2;  // Term of the log entry.
+  bytes data = 3;   // Raw data that the log entry encapsulates.
+}
+
 message AppendEntriesReq {
-  uint64 term = 1;
-  string leader_id = 2;
-  uint64 prev_log_index = 3;
-  uint64 prev_log_term = 4;
-  repeated bytes entries = 5;
-  uint64 leader_commit = 6;
+  uint64 term = 1;            // Leader's term.
+  string leader_id = 2;       // So follower can redirect client.
+  uint64 prev_log_index = 3;  // Index of log entry immediately preceding new ones.
+  uint64 prev_log_term = 4;   // Term of prevLogIndex entry.
+  repeated Log entries = 5;   // Log entries to store (empty for heartbeat; may send more than one for efficiency).
+  uint64 leader_commit = 6;   // Leader's commitIndex.
 }
 
 message AppendEntriesResp {
-  uint64 term = 1;
-  bool success = 2;
+  uint64 term = 1;  // Current term, for leader to update itself.
+  bool success = 2; // True if follower contained entry matching prevLogIndex and prevLogTerm.
 }
 
 message RequestVoteReq {
-  uint64 term = 1;
-  string candidate_id = 2;
-  uint64 last_log_index = 3;
-  uint64 last_log_term = 4;
+  uint64 term = 1;            // Candidate's term.
+  string candidate_id = 2;    // Candidate requesting vote.
+  uint64 last_log_index = 3;  // Index of candidate's last log entry.
+  uint64 last_log_term = 4;   // Term of candidate's last log entry.
 }
 
 message RequestVoteResp {
-  uint64 term = 1;
-  bool vote_granted = 2;
-}
-
-message Log {
-  uint64 index = 1;
-  uint64 term = 2;
-  bytes data = 3;
+  uint64 term = 1;        // Current term, for candidate to update itself.
+  bool vote_granted = 2;  // True means candidate received vote.
 }
 
 service Raft {
