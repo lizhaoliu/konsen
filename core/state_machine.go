@@ -40,6 +40,12 @@ type Storage interface {
 	// PutLogs stores the given log entries into storage.
 	PutLogs(logs []*konsen.Log) error
 
+	// FirstLogIndex returns the first(oldest) log entry's index.
+	FirstLogIndex() (uint64, error)
+
+	// LastLogIndex returns the last(newest) log entry's index.
+	LastLogIndex() (uint64, error)
+
 	//
 	DeleteLogs(minLogIndex uint64) error
 }
@@ -68,7 +74,18 @@ type StateMachine struct {
 	matchIndex map[string]uint64 // For each server, index of highest log entry known to be replicated on that server (initialized to 0, increases monotonically).
 }
 
-func NewStateMachine(cluster *konsen.Cluster) (*StateMachine, error) {
+type appendEntriesWrap struct {
+	req *konsen.AppendEntriesReq
+	ch  chan<- *konsen.AppendEntriesResp
+}
+
+type requestVoteWrap struct {
+	req *konsen.RequestVoteReq
+	ch  chan<- *konsen.RequestVoteResp
+}
+
+// NewStateMachine
+func NewStateMachine(cluster *konsen.Cluster, storage Storage) (*StateMachine, error) {
 	if len(cluster.GetNodes())%2 != 1 {
 		return nil, fmt.Errorf("number of nodes in the cluster must be an odd number, got: %d", len(cluster.GetNodes()))
 	}
@@ -79,6 +96,8 @@ func NewStateMachine(cluster *konsen.Cluster) (*StateMachine, error) {
 		timerGateCh:     make(chan struct{}),
 		heartbeatGateCh: make(chan struct{}),
 		resetTimerCh:    make(chan struct{}),
+
+		storage: storage,
 
 		commitIndex: 0,
 		lastApplied: 0,
@@ -91,7 +110,8 @@ func NewStateMachine(cluster *konsen.Cluster) (*StateMachine, error) {
 	return sm, nil
 }
 
-func (sm *StateMachine) Run(ctx context.Context) error {
+// Start starts the state machine and blocks until done.
+func (sm *StateMachine) Start(ctx context.Context) error {
 	var wg sync.WaitGroup
 	sm.startMessageLoop(ctx, &wg)
 	sm.startElectionLoop(ctx, &wg)
@@ -100,13 +120,59 @@ func (sm *StateMachine) Run(ctx context.Context) error {
 	return nil
 }
 
+// AppendEntries puts the incoming AppendEntries request in main message channel and waits for result.
+func (sm *StateMachine) AppendEntries(ctx context.Context, req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
+	ch := make(chan *konsen.AppendEntriesResp)
+	wrap := appendEntriesWrap{
+		req: req,
+		ch:  ch,
+	}
+	sm.msgCh <- wrap
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		return resp, nil
+	}
+}
+
+// RequestVote puts the incoming RequestVote request in main message channel and waits for result.
+func (sm *StateMachine) RequestVote(ctx context.Context, req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
+	ch := make(chan *konsen.RequestVoteResp)
+	wrap := requestVoteWrap{
+		req: req,
+		ch:  ch,
+	}
+	sm.msgCh <- wrap
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		return resp, nil
+	}
+}
+
+func (sm *StateMachine) checkTerm(term, currentTerm uint64) error {
+	if term > currentTerm {
+		if err := sm.storage.SetCurrentTerm(term); err != nil {
+			return fmt.Errorf("failed  to set current term: %v", err)
+		}
+		sm.role = konsen.Role_FOLLOWER
+	}
+	return nil
+}
+
+// startMessageLoop starts the main message loop.
 func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
 		for {
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
-			if sm.commitIndex > sm.lastApplied {
-				// TODO.
+			for sm.commitIndex > sm.lastApplied {
+				// TODO: apply log[lastApplied].
+				sm.lastApplied++
 			}
 
 			select {
@@ -114,30 +180,75 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 				return
 			case <-sm.stopCh:
 				return
-			case msg := <-sm.msgCh:
+			case msg, open := <-sm.msgCh:
+				if !open {
+					return
+				}
+
 				switch v := msg.(type) {
-				case konsen.AppendEntriesReq:
+				case appendEntriesWrap:
 					sm.resetTimerCh <- struct{}{}
 
-					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
+					term := v.req.GetTerm()
+					currentTerm, err := sm.storage.GetCurrentTerm()
+					if err != nil {
+						log.Fatalf("Failed to get current term: %v", err)
+					}
+					if err := sm.checkTerm(term, currentTerm); err != nil {
+						log.Errorf("%v", err)
+					}
+
+					// 1. Reply false if term < currentTerm.
+					if term < currentTerm {
+						v.ch <- &konsen.AppendEntriesResp{
+							Term:    currentTerm,
+							Success: false,
+						}
+						continue
+					}
+
+					// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
+					logEntry, err := sm.storage.GetLog(v.req.GetPrevLogIndex())
+					if err != nil {
+						log.Fatalf("Failed to get log: %v", err)
+					}
+					if logEntry.GetTerm() != v.req.GetPrevLogTerm() {
+						v.ch <- &konsen.AppendEntriesResp{
+							Term:    currentTerm,
+							Success: false,
+						}
+						continue
+					}
+
+					// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it.
+					// TODO.
+
+					// 4. Append any new entries not already in the log.
+					// TODO.
+
+					// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
+					if v.req.GetLeaderCommit() > sm.commitIndex {
+						// TODO.
+					}
 
 					sm.timerGateCh <- struct{}{}
-				case konsen.AppendEntriesResp:
+				case requestVoteWrap:
 					sm.resetTimerCh <- struct{}{}
 
-					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 
 					sm.timerGateCh <- struct{}{}
 				case konsen.RequestVoteReq:
 					sm.resetTimerCh <- struct{}{}
 
-					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 
 					sm.timerGateCh <- struct{}{}
 				case konsen.RequestVoteResp:
 					sm.resetTimerCh <- struct{}{}
 
-					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+					// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 
 					sm.timerGateCh <- struct{}{}
 				case electionTimeout:
@@ -162,9 +273,12 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 	}()
 }
 
+// startElectionLoop starts the election timeout monitoring loop.
 func (sm *StateMachine) startElectionLoop(ctx context.Context, wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
 		// Election timer worker.
 		for {
 			// Waits for signal.
@@ -188,9 +302,12 @@ func (sm *StateMachine) startElectionLoop(ctx context.Context, wg *sync.WaitGrou
 	}()
 }
 
+// startHeartbeatLoop starts the heartbeat loop.
 func (sm *StateMachine) startHeartbeatLoop(ctx context.Context, wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
 		// Heartbeat worker.
 		ticker := time.NewTicker(defaultHeartbeat)
 		defer ticker.Stop()
@@ -210,6 +327,7 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context, wg *sync.WaitGro
 	}()
 }
 
+// nextTimeout calculates the next election timeout duration.
 func (sm *StateMachine) nextTimeout() time.Duration {
 	timeout := rand.Int63n(defaultTimeoutSpan) + int64(defaultMinTimeout)
 	return time.Duration(timeout)

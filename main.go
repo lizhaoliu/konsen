@@ -4,26 +4,37 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
+	"os/signal"
+	"syscall"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/lizhaoliu/konsen/v2/core"
+	net2 "github.com/lizhaoliu/konsen/v2/net"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 var (
-	clusterConfigFile string
+	clusterConfigPath string
+	dbFilePath        string
 )
 
 func init() {
-	flag.StringVar(&clusterConfigFile, "cluster_config_file", "", "")
+	flag.StringVar(&clusterConfigPath, "cluster_config_path", "", "Cluster configuration file path.")
+	flag.StringVar(&dbFilePath, "db_file_path", "", "Local DB file path.")
 	flag.Parse()
-	//if clusterConfigFile == "" {
-	//    logrus.Fatalf("cluster_config_file is unspecified.")
-	//}
+	if clusterConfigPath == "" {
+		logrus.Fatalf("cluster_config_file is unspecified.")
+	}
+	if dbFilePath == "" {
+		logrus.Fatalf("db_file_path is unspecified.")
+	}
 
 	logrus.SetOutput(os.Stdout)
-	logrus.SetLevel(logrus.TraceLevel)
+	logrus.SetLevel(logrus.InfoLevel)
 }
 
 func parseClusterConfig(configFilePath string) (*konsen.Cluster, error) {
@@ -32,7 +43,7 @@ func parseClusterConfig(configFilePath string) (*konsen.Cluster, error) {
 		return nil, fmt.Errorf("failed to read cluster config file: %v", err)
 	}
 	cluster := &konsen.Cluster{}
-	if err := proto.UnmarshalText(string(buf), cluster); err != nil {
+	if err := protojson.Unmarshal(buf, cluster); err != nil {
 		return nil, fmt.Errorf("failed to parse cluster config file: %v", err)
 	}
 
@@ -41,39 +52,51 @@ func parseClusterConfig(configFilePath string) (*konsen.Cluster, error) {
 		return nil, fmt.Errorf("number of nodes in a cluster must be odd, got: %d", numNodes)
 	}
 
-	return cluster, nil
+	for _, node := range cluster.GetNodes() {
+		if cluster.GetLocalNode().GetEndpoint() == node.GetEndpoint() {
+			return cluster, nil
+		}
+	}
+
+	return nil, fmt.Errorf("local node endpoint %q is not in cluster", cluster.GetLocalNode().GetEndpoint())
 }
 
 func main() {
-	c := &konsen.Cluster{
-		Nodes: []*konsen.Node{
-			{Endpoint: "192.168.86.25:10001"},
-			{Endpoint: "192.168.86.25:10002"},
-		},
-		LocalNode: &konsen.Node{Endpoint: "192.168.86.25:10001"},
-	}
-	f, err := os.Create("C:\\Users\\lizhaoliu\\repos\\konsen\\aaa.txt")
+	cluster, err := parseClusterConfig(clusterConfigPath)
 	if err != nil {
-		panic(err)
+		logrus.Fatalf("%v", err)
 	}
-	defer f.Close()
-	if err := proto.MarshalText(f, c); err != nil {
-		panic(err)
-	}
-	s := proto.MarshalTextString(c)
-	logrus.Infof("%s", s)
 
-	//cluster, err := parseClusterConfig(clusterConfigFile)
-	//if err != nil {
-	//    logrus.Fatalf("%v", err)
-	//}
-	//cluster.GetLocalNode()
-	//
-	//impl := net.NewRaftServerImpl(net.RaftServerImplConfig{
-	//    Endpoint:     "192.168.86.25:32768",
-	//    StateMachine: nil,
-	//})
-	//if err := impl.Start(); err != nil {
-	//    logrus.Fatalf("%v", err)
-	//}
+	storage, err := core.NewBoltDB(core.BoltDBConfig{FilePath: dbFilePath})
+	if err != nil {
+		logrus.Fatalf("%v", err)
+	}
+
+	sm, err := core.NewStateMachine(cluster, storage)
+	if err != nil {
+		logrus.Fatalf("Failed to create state machine: %v", err)
+	}
+
+	serverImpl := net2.NewRaftServerImpl(net2.RaftServerImplConfig{
+		StateMachine: sm,
+	})
+	endpoint := cluster.GetLocalNode().GetEndpoint()
+	logrus.Infof("Starting Raft server on: %q", endpoint)
+	lis, err := net.Listen("tcp", endpoint)
+	if err != nil {
+		logrus.Fatalf("Failed to start Raft server: %v", err)
+	}
+	server := grpc.NewServer()
+	konsen.RegisterRaftServer(server, serverImpl)
+	go func() {
+		server.Serve(lis)
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	logrus.Warnf("%v", sig)
+
+	sm.Close()
+	server.GracefulStop()
 }

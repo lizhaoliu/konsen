@@ -1,29 +1,25 @@
 package net
 
 import (
-	"fmt"
+	"context"
 	"io"
-	"net"
 
 	"github.com/lizhaoliu/konsen/v2/core"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
-	"google.golang.org/grpc"
+	"github.com/sirupsen/logrus"
 )
 
 type RaftServerImpl struct {
-	endpoint string
-	sm       *core.StateMachine
+	sm *core.StateMachine
 }
 
 type RaftServerImplConfig struct {
-	Endpoint     string
 	StateMachine *core.StateMachine
 }
 
 func NewRaftServerImpl(config RaftServerImplConfig) *RaftServerImpl {
 	impl := &RaftServerImpl{
-		endpoint: config.Endpoint,
-		sm:       config.StateMachine,
+		sm: config.StateMachine,
 	}
 	return impl
 }
@@ -32,13 +28,21 @@ func (r *RaftServerImpl) AppendEntries(server konsen.Raft_AppendEntriesServer) e
 	for {
 		req, err := server.Recv()
 		if err == io.EOF {
+			logrus.Infof("Received <EOF>, now exit.")
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		// TODO: implementation.
-		req.GetTerm()
+
+		resp, err := r.sm.AppendEntries(context.Background(), req)
+		err = server.Send(resp)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
 }
 
@@ -46,22 +50,20 @@ func (r *RaftServerImpl) RequestVote(server konsen.Raft_RequestVoteServer) error
 	for {
 		req, err := server.Recv()
 		if err == io.EOF {
+			logrus.Infof("Received <EOF>, now exit.")
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		// TODO: implementation.
-		req.GetTerm()
-	}
-}
 
-func (r *RaftServerImpl) Start() error {
-	lis, err := net.Listen("tcp", r.endpoint)
-	if err != nil {
-		return fmt.Errorf("failed to start Raft server on %q: %v", r.endpoint, err)
+		resp, err := r.sm.RequestVote(context.Background(), req)
+		err = server.Send(resp)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
-	server := grpc.NewServer()
-	konsen.RegisterRaftServer(server, r)
-	return server.Serve(lis)
 }

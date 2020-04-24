@@ -60,7 +60,11 @@ func (b *BoltDB) GetCurrentTerm() (uint64, error) {
 	var term uint64
 	if err := b.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(statesBucketName)
-		term = bytesToUint64(b.Get(currentTermKey))
+		buf := b.Get(currentTermKey)
+		if buf == nil {
+			return nil
+		}
+		term = bytesToUint64(buf)
 		return nil
 	}); err != nil {
 		return 0, err
@@ -101,12 +105,12 @@ func (b *BoltDB) GetLog(logIndex uint64) (*konsen.Log, error) {
 	if err := b.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(logsBucketName)
 		k := uint64ToBytes(logIndex)
-		logBytes := b.Get(k)
-		if logBytes == nil {
+		buf := b.Get(k)
+		if buf == nil {
 			return nil
 		}
 		log = &konsen.Log{}
-		return proto.Unmarshal(logBytes, log)
+		return proto.Unmarshal(buf, log)
 	}); err != nil {
 		return nil, err
 	}
@@ -135,7 +139,47 @@ func (b *BoltDB) PutLogs(logs []*konsen.Log) error {
 }
 
 func (b *BoltDB) DeleteLogs(minLogIndex uint64) error {
-	panic("implement me")
+	return b.db.Update(func(tx *bolt.Tx) error {
+		c := tx.Bucket(logsBucketName).Cursor()
+		for k, _ := c.Seek(uint64ToBytes(minLogIndex)); k != nil; k, _ = c.Next() {
+			if err := c.Delete(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (b *BoltDB) FirstLogIndex() (uint64, error) {
+	var index uint64
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(logsBucketName).Cursor()
+		_, buf := c.First()
+		if buf == nil {
+			return nil
+		}
+		index = bytesToUint64(buf)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return index, nil
+}
+
+func (b *BoltDB) LastLogIndex() (uint64, error) {
+	var index uint64
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(logsBucketName).Cursor()
+		_, buf := c.Last()
+		if buf == nil {
+			return nil
+		}
+		index = bytesToUint64(buf)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return index, nil
 }
 
 func (b *BoltDB) Close() error {

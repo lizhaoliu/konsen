@@ -1,3 +1,7 @@
 package core
 
-type LogNotFoundErr struct{}
+import "errors"
+
+var (
+	ErrLogNotFound = errors.New("")
+)
