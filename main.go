@@ -9,8 +9,8 @@ import (
 	"syscall"
 
 	"github.com/lizhaoliu/konsen/v2/core"
-	net2 "github.com/lizhaoliu/konsen/v2/net"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	"github.com/lizhaoliu/konsen/v2/rpc"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -24,6 +24,7 @@ func init() {
 	flag.StringVar(&clusterConfigPath, "cluster_config_path", "", "Cluster configuration file path.")
 	flag.StringVar(&dbFilePath, "db_file_path", "", "Local DB file path.")
 	flag.Parse()
+
 	if clusterConfigPath == "" {
 		logrus.Fatalf("cluster_config_path is unspecified.")
 	}
@@ -59,6 +60,23 @@ func parseClusterConfig(configFilePath string) (*konsen.Cluster, error) {
 	return nil, fmt.Errorf("local node endpoint %q is not in cluster", cluster.GetLocalNode().GetEndpoint())
 }
 
+func createClients(cluster *konsen.Cluster) (map[string]rpc.RaftClient, error) {
+	clients := make(map[string]rpc.RaftClient)
+	for _, node := range cluster.GetNodes() {
+		endpoint := node.GetEndpoint()
+		if endpoint != cluster.GetLocalNode().GetEndpoint() {
+			c, err := rpc.NewRaftGRPCClient(rpc.RaftGRPCClientConfig{
+				Endpoint: endpoint,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to create GRPC client: %v", err)
+			}
+			clients[endpoint] = c
+		}
+	}
+	return clients, nil
+}
+
 func main() {
 	cluster, err := parseClusterConfig(clusterConfigPath)
 	if err != nil {
@@ -70,12 +88,21 @@ func main() {
 		logrus.Fatalf("%v", err)
 	}
 
-	sm, err := core.NewStateMachine(cluster, storage)
+	clients, err := createClients(cluster)
+	if err != nil {
+		logrus.Fatalf("%v", err)
+	}
+
+	sm, err := core.NewStateMachine(core.StateMachineConfig{
+		Storage: storage,
+		Cluster: cluster,
+		Clients: clients,
+	})
 	if err != nil {
 		logrus.Fatalf("Failed to create state machine: %v", err)
 	}
 
-	server := net2.NewRaftServer(net2.RaftServerConfig{
+	server := rpc.NewRaftServer(rpc.RaftServerConfig{
 		Endpoint:     cluster.GetLocalNode().GetEndpoint(),
 		StateMachine: sm,
 	})

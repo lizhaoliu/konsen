@@ -96,16 +96,6 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 
 // Run starts the state machine and blocks until done.
 func (sm *StateMachine) Run(ctx context.Context) {
-	for _, node := range sm.cluster.GetNodes() {
-		endpoint := node.GetEndpoint()
-		if endpoint != sm.cluster.GetLocalNode().GetEndpoint() {
-			c, err := rpc.NewRaftGRPCClient(rpc.RaftGRPCClientConfig{Endpoint: endpoint})
-			if err != nil {
-
-			}
-			sm.clients[endpoint] = c
-		}
-	}
 	var wg sync.WaitGroup
 	sm.startMessageLoop(ctx, &wg)
 	sm.startElectionLoop(ctx, &wg)
