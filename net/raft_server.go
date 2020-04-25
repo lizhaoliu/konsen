@@ -2,68 +2,55 @@ package net
 
 import (
 	"context"
-	"io"
+	"net"
 
 	"github.com/lizhaoliu/konsen/v2/core"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
 )
 
-type RaftServerImpl struct {
-	sm *core.StateMachine
+type RaftServer struct {
+	endpoint string
+	sm       *core.StateMachine
+	server   *grpc.Server
 }
 
-type RaftServerImplConfig struct {
+type RaftServerConfig struct {
+	Endpoint     string
 	StateMachine *core.StateMachine
 }
 
-func NewRaftServerImpl(config RaftServerImplConfig) *RaftServerImpl {
-	impl := &RaftServerImpl{
-		sm: config.StateMachine,
+func NewRaftServer(config RaftServerConfig) *RaftServer {
+	s := &RaftServer{
+		endpoint: config.Endpoint,
+		sm:       config.StateMachine,
 	}
-	return impl
+	return s
 }
 
-func (r *RaftServerImpl) AppendEntries(server konsen.Raft_AppendEntriesServer) error {
-	for {
-		req, err := server.Recv()
-		if err == io.EOF {
-			logrus.Infof("Received <EOF>, now exit.")
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-
-		resp, err := r.sm.AppendEntries(context.Background(), req)
-		err = server.Send(resp)
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-	}
+func (r *RaftServer) AppendEntries(ctx context.Context, req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
+	return r.sm.AppendEntries(ctx, req)
 }
 
-func (r *RaftServerImpl) RequestVote(server konsen.Raft_RequestVoteServer) error {
-	for {
-		req, err := server.Recv()
-		if err == io.EOF {
-			logrus.Infof("Received <EOF>, now exit.")
-			return nil
-		}
-		if err != nil {
-			return err
-		}
+func (r *RaftServer) RequestVote(ctx context.Context, req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
+	return r.sm.RequestVote(ctx, req)
+}
 
-		resp, err := r.sm.RequestVote(context.Background(), req)
-		err = server.Send(resp)
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
+func (r *RaftServer) Serve() error {
+	logrus.Infof("Starting Raft server on: %q", r.endpoint)
+	lis, err := net.Listen("tcp", r.endpoint)
+	if err != nil {
+		logrus.Fatalf("Failed to start Raft server: %v", err)
+	}
+	server := grpc.NewServer()
+	konsen.RegisterRaftServer(server, r)
+	r.server = server
+	return server.Serve(lis)
+}
+
+func (r *RaftServer) Stop() {
+	if r.server != nil {
+		r.server.GracefulStop()
 	}
 }

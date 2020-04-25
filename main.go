@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,7 +12,6 @@ import (
 	net2 "github.com/lizhaoliu/konsen/v2/net"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -27,7 +25,7 @@ func init() {
 	flag.StringVar(&dbFilePath, "db_file_path", "", "Local DB file path.")
 	flag.Parse()
 	if clusterConfigPath == "" {
-		logrus.Fatalf("cluster_config_file is unspecified.")
+		logrus.Fatalf("cluster_config_path is unspecified.")
 	}
 	if dbFilePath == "" {
 		logrus.Fatalf("db_file_path is unspecified.")
@@ -77,26 +75,20 @@ func main() {
 		logrus.Fatalf("Failed to create state machine: %v", err)
 	}
 
-	serverImpl := net2.NewRaftServerImpl(net2.RaftServerImplConfig{
+	server := net2.NewRaftServer(net2.RaftServerConfig{
+		Endpoint:     cluster.GetLocalNode().GetEndpoint(),
 		StateMachine: sm,
 	})
-	endpoint := cluster.GetLocalNode().GetEndpoint()
-	logrus.Infof("Starting Raft server on: %q", endpoint)
-	lis, err := net.Listen("tcp", endpoint)
-	if err != nil {
-		logrus.Fatalf("Failed to start Raft server: %v", err)
-	}
-	server := grpc.NewServer()
-	konsen.RegisterRaftServer(server, serverImpl)
 	go func() {
-		server.Serve(lis)
+		server.Serve()
 	}()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 	sig := <-sigCh
-	logrus.Warnf("%v", sig)
+	logrus.Infof("Syscall: %v", sig)
 
 	sm.Close()
-	server.GracefulStop()
+	server.Stop()
+	storage.Close()
 }

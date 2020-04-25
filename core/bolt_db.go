@@ -158,7 +158,7 @@ func (b *BoltDB) FirstLogIndex() (uint64, error) {
 	var index uint64
 	if err := b.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(logsBucketName).Cursor()
-		_, buf := c.First()
+		buf, _ := c.First()
 		if buf == nil {
 			return nil
 		}
@@ -174,7 +174,7 @@ func (b *BoltDB) LastLogIndex() (uint64, error) {
 	var index uint64
 	if err := b.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(logsBucketName).Cursor()
-		_, buf := c.Last()
+		buf, _ := c.Last()
 		if buf == nil {
 			return nil
 		}
@@ -184,6 +184,46 @@ func (b *BoltDB) LastLogIndex() (uint64, error) {
 		return 0, err
 	}
 	return index, nil
+}
+
+func (b *BoltDB) FirstLogTerm() (uint64, error) {
+	var term uint64
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(logsBucketName).Cursor()
+		_, buf := c.First()
+		if buf == nil {
+			return nil
+		}
+		log := &konsen.Log{}
+		if err := proto.Unmarshal(buf, log); err != nil {
+			return err
+		}
+		term = log.GetTerm()
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return term, nil
+}
+
+func (b *BoltDB) LastLogTerm() (uint64, error) {
+	var term uint64
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(logsBucketName).Cursor()
+		_, buf := c.Last()
+		if buf == nil {
+			return nil
+		}
+		log := &konsen.Log{}
+		if err := proto.Unmarshal(buf, log); err != nil {
+			return err
+		}
+		term = log.GetTerm()
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return term, nil
 }
 
 func (b *BoltDB) Close() error {

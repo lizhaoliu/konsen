@@ -44,8 +44,8 @@ message RequestVoteResp {
 
 service Raft {
   // Sends "AppendEntries" request.
-  rpc AppendEntries(stream AppendEntriesReq) returns (stream AppendEntriesResp) {}
+  rpc AppendEntries(AppendEntriesReq) returns (AppendEntriesResp) {}
 
   // Sends "RequestVote" request.
-  rpc RequestVote(stream RequestVoteReq) returns (stream RequestVoteResp) {}
+  rpc RequestVote(RequestVoteReq) returns (RequestVoteResp) {}
 }
