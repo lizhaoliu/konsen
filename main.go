@@ -60,8 +60,8 @@ func parseClusterConfig(configFilePath string) (*konsen.Cluster, error) {
 	return nil, fmt.Errorf("local node endpoint %q is not in cluster", cluster.GetLocalNode().GetEndpoint())
 }
 
-func createClients(cluster *konsen.Cluster) (map[string]rpc.RaftClient, error) {
-	clients := make(map[string]rpc.RaftClient)
+func createClients(cluster *konsen.Cluster) (map[string]core.RaftClient, error) {
+	clients := make(map[string]core.RaftClient)
 	for _, node := range cluster.GetNodes() {
 		endpoint := node.GetEndpoint()
 		if endpoint != cluster.GetLocalNode().GetEndpoint() {
@@ -102,7 +102,7 @@ func main() {
 		logrus.Fatalf("Failed to create state machine: %v", err)
 	}
 
-	server := rpc.NewRaftServer(rpc.RaftServerConfig{
+	server := rpc.NewRaftGRPCServer(rpc.RaftGRPCServerConfig{
 		Endpoint:     cluster.GetLocalNode().GetEndpoint(),
 		StateMachine: sm,
 	})

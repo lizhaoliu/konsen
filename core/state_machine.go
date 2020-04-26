@@ -8,7 +8,6 @@ import (
 	"time"
 
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
-	"github.com/lizhaoliu/konsen/v2/rpc"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -43,14 +42,14 @@ type StateMachine struct {
 
 	// Cluster info.
 	cluster *konsen.Cluster
-	clients map[string]rpc.RaftClient
+	clients map[string]RaftClient
 }
 
 // StateMachineConfig
 type StateMachineConfig struct {
-	Storage Storage                   // Local storage instance.
-	Cluster *konsen.Cluster           // Cluster definition.
-	Clients map[string]rpc.RaftClient // A map of {endpoint: client instance}.
+	Storage Storage               // Local storage instance.
+	Cluster *konsen.Cluster       // Cluster definition.
+	Clients map[string]RaftClient // A map of {endpoint: client instance}.
 }
 
 type appendEntriesWrap struct {

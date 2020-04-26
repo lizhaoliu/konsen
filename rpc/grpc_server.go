@@ -10,34 +10,34 @@ import (
 	"google.golang.org/grpc"
 )
 
-type RaftServer struct {
+type RaftGRPCServer struct {
 	endpoint string
 	sm       *core.StateMachine
 	server   *grpc.Server
 }
 
-type RaftServerConfig struct {
+type RaftGRPCServerConfig struct {
 	Endpoint     string
 	StateMachine *core.StateMachine
 }
 
-func NewRaftServer(config RaftServerConfig) *RaftServer {
-	s := &RaftServer{
+func NewRaftGRPCServer(config RaftGRPCServerConfig) *RaftGRPCServer {
+	s := &RaftGRPCServer{
 		endpoint: config.Endpoint,
 		sm:       config.StateMachine,
 	}
 	return s
 }
 
-func (r *RaftServer) AppendEntries(ctx context.Context, req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
+func (r *RaftGRPCServer) AppendEntries(ctx context.Context, req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
 	return r.sm.AppendEntries(ctx, req)
 }
 
-func (r *RaftServer) RequestVote(ctx context.Context, req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
+func (r *RaftGRPCServer) RequestVote(ctx context.Context, req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
 	return r.sm.RequestVote(ctx, req)
 }
 
-func (r *RaftServer) Serve() error {
+func (r *RaftGRPCServer) Serve() error {
 	logrus.Infof("Starting Raft server on: %q", r.endpoint)
 	lis, err := net.Listen("tcp", r.endpoint)
 	if err != nil {
@@ -49,7 +49,7 @@ func (r *RaftServer) Serve() error {
 	return server.Serve(lis)
 }
 
-func (r *RaftServer) Stop() {
+func (r *RaftGRPCServer) Stop() {
 	if r.server != nil {
 		r.server.GracefulStop()
 	}
