@@ -40,8 +40,8 @@ type StateMachine struct {
 	nextIndex  map[string]uint64 // For each server, index of the next log entry to send to that server (initialized to leader last log index + 1).
 	matchIndex map[string]uint64 // For each server, index of highest log entry known to be replicated on that server (initialized to 0, increases monotonically).
 
-	// Cluster info.
-	cluster *konsen.Cluster
+	// ClusterConfig info.
+	cluster *ClusterConfig
 	clients map[string]RaftClient
 
 	wg sync.WaitGroup
@@ -50,7 +50,7 @@ type StateMachine struct {
 // StateMachineConfig
 type StateMachineConfig struct {
 	Storage Storage               // Local storage instance.
-	Cluster *konsen.Cluster       // Cluster definition.
+	Cluster *ClusterConfig        // Cluster configuration.
 	Clients map[string]RaftClient // A map of {endpoint: client instance}.
 }
 
@@ -78,8 +78,8 @@ type appendEntriesSignal struct{}
 
 // NewStateMachine
 func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
-	if len(config.Cluster.GetNodes())%2 != 1 {
-		return nil, fmt.Errorf("number of nodes in the cluster must be an odd number, got: %d", len(config.Cluster.GetNodes()))
+	if len(config.Cluster.Endpoints)%2 != 1 {
+		return nil, fmt.Errorf("number of nodes in the cluster must be an odd number, got: %d", len(config.Cluster.Endpoints))
 	}
 
 	sm := &StateMachine{
@@ -363,7 +363,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 	if resp.GetVoteGranted() {
 		sm.numVotes++
 		// If votes received from majority of servers, become leader.
-		if sm.numVotes > len(sm.cluster.GetNodes())/2 {
+		if sm.numVotes > len(sm.cluster.Endpoints)/2 {
 			if err := sm.becomeLeader(currentTerm); err != nil {
 				return fmt.Errorf("failed to become leader: %v", err)
 			}
@@ -374,7 +374,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 }
 
 func (sm *StateMachine) becomeLeader(term uint64) error {
-	log.Infof("%q has become leader for term %d.", sm.cluster.GetLocalNode().GetEndpoint(), term)
+	log.Infof("%q has become leader for term %d.", sm.cluster.LocalEndpoint, term)
 	sm.role = konsen.Role_LEADER
 	lastLogIndex, err := sm.storage.LastLogIndex()
 	if err != nil {
@@ -407,13 +407,12 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 	}
 	req := &konsen.RequestVoteReq{
 		Term:         currentTerm,
-		CandidateId:  sm.cluster.GetLocalNode().GetEndpoint(),
+		CandidateId:  sm.cluster.LocalEndpoint,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
-	for _, node := range sm.cluster.GetNodes() {
-		endpoint := node.GetEndpoint()
-		if endpoint != sm.cluster.GetLocalNode().GetEndpoint() {
+	for _, endpoint := range sm.cluster.Endpoints {
+		if endpoint != sm.cluster.LocalEndpoint {
 			go func() {
 				resp, err := sm.clients[endpoint].RequestVote(ctx, req)
 				if err != nil {
@@ -439,9 +438,8 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 		return fmt.Errorf("failed to get current term: %v", err)
 	}
 
-	for _, node := range sm.cluster.GetNodes() {
-		endpoint := node.GetEndpoint()
-		if endpoint != sm.cluster.GetLocalNode().GetEndpoint() {
+	for _, endpoint := range sm.cluster.Endpoints {
+		if endpoint != sm.cluster.LocalEndpoint {
 			prevLogIndex := sm.nextIndex[endpoint] - 1
 			prevLogTerm, err := sm.storage.GetLogTerm(prevLogIndex)
 			if err != nil {
@@ -453,7 +451,7 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 			}
 			req := &konsen.AppendEntriesReq{
 				Term:         currentTerm,
-				LeaderId:     sm.cluster.GetLocalNode().GetEndpoint(),
+				LeaderId:     sm.cluster.LocalEndpoint,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  prevLogTerm,
 				Entries:      entries,

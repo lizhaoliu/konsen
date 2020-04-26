@@ -2,31 +2,31 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
 	"strconv"
-	"strings"
 
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	"github.com/lizhaoliu/konsen/v2/core"
 	"github.com/sirupsen/logrus"
-	"google.golang.org/protobuf/encoding/protojson"
+	"gopkg.in/yaml.v2"
 )
 
+const clusterConfigFileName = "cluster.yml"
+
 var (
-	endpointsFlag string
-	outputDir     string
-	binaryPath    string
+	clusterConfigPath string
+	outputDir         string
+	binaryPath        string
 )
 
 func init() {
-	flag.StringVar(&endpointsFlag, "endpoints", "", "Endpoints in the cluster, separated by comma.")
+	flag.StringVar(&clusterConfigPath, "cluster_config_path", "", "Cluster config file path.")
 	flag.StringVar(&outputDir, "output_dir", "", "Output directory.")
 	flag.StringVar(&binaryPath, "binary_path", "", "Binary path.")
 	flag.Parse()
 
-	if endpointsFlag == "" {
+	if clusterConfigPath == "" {
 		logrus.Fatalf("endpoints is unspecified.")
 	}
 	if outputDir == "" {
@@ -43,26 +43,32 @@ func main() {
 		logrus.Fatalf("Failed to read binary file: %v", err)
 	}
 
-	endpoints := strings.Split(endpointsFlag, ",")
-	var nodes []*konsen.Node
-	for _, endpoint := range endpoints {
-		nodes = append(nodes, &konsen.Node{Endpoint: endpoint})
-
+	buf, err := ioutil.ReadFile(clusterConfigPath)
+	if err != nil {
+		logrus.Fatalf("Failed to read cluster config file: %v", err)
 	}
-	for i, node := range nodes {
+
+	cluster := &core.ClusterConfig{}
+	if err := yaml.Unmarshal(buf, cluster); err != nil {
+		logrus.Fatalf("Failed to unmarshal cluster config file: %v", err)
+	}
+
+	for i, endpoint := range cluster.Endpoints {
 		dirPath := path.Join(outputDir, strconv.Itoa(i))
 		if err := os.MkdirAll(dirPath, 0755); err != nil {
 			logrus.Fatalf("Failed to create dir: %v", err)
 		}
 
-		cluster := &konsen.Cluster{
-			Nodes:     nodes,
-			LocalNode: node,
-			Name:      fmt.Sprintf("node_%d", i),
+		c := &core.ClusterConfig{
+			Endpoints:     cluster.Endpoints,
+			LocalEndpoint: endpoint,
 		}
-		clusterJson := protojson.Format(cluster)
-		filePath := path.Join(dirPath, "cluster_config.json")
-		if err := ioutil.WriteFile(filePath, []byte(clusterJson), 0644); err != nil {
+		buf, err := yaml.Marshal(c)
+		if err != nil {
+			logrus.Fatalf("Failed to marshal cluster config: %v", err)
+		}
+		filePath := path.Join(dirPath, clusterConfigFileName)
+		if err := ioutil.WriteFile(filePath, buf, 0644); err != nil {
 			logrus.Fatalf("Failed to write cluster config JSON file: %v", err)
 		}
 

@@ -12,10 +12,9 @@ import (
 	"syscall"
 
 	"github.com/lizhaoliu/konsen/v2/core"
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
-	"github.com/lizhaoliu/konsen/v2/rpc"
+	"github.com/lizhaoliu/konsen/v2/net"
 	"github.com/sirupsen/logrus"
-	"google.golang.org/protobuf/encoding/protojson"
+	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -41,36 +40,35 @@ func init() {
 	logrus.SetLevel(logrus.InfoLevel)
 }
 
-func parseClusterConfig(configFilePath string) (*konsen.Cluster, error) {
+func parseClusterConfig(configFilePath string) (*core.ClusterConfig, error) {
 	buf, err := ioutil.ReadFile(configFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cluster config file: %v", err)
 	}
-	cluster := &konsen.Cluster{}
-	if err := protojson.Unmarshal(buf, cluster); err != nil {
-		return nil, fmt.Errorf("failed to parse cluster config file: %v", err)
+	cluster := &core.ClusterConfig{}
+	if err := yaml.Unmarshal(buf, cluster); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal cluster config file: %v", err)
 	}
 
-	numNodes := len(cluster.GetNodes())
+	numNodes := len(cluster.Endpoints)
 	if numNodes%2 != 1 {
 		return nil, fmt.Errorf("number of nodes in a cluster must be odd, got: %d", numNodes)
 	}
 
-	for _, node := range cluster.GetNodes() {
-		if cluster.GetLocalNode().GetEndpoint() == node.GetEndpoint() {
+	for _, endpoint := range cluster.Endpoints {
+		if cluster.LocalEndpoint == endpoint {
 			return cluster, nil
 		}
 	}
 
-	return nil, fmt.Errorf("local node endpoint %q is not in cluster", cluster.GetLocalNode().GetEndpoint())
+	return nil, fmt.Errorf("local server endpoint %q is not in cluster", cluster.LocalEndpoint)
 }
 
-func createClients(cluster *konsen.Cluster) (map[string]core.RaftClient, error) {
+func createClients(cluster *core.ClusterConfig) (map[string]core.RaftClient, error) {
 	clients := make(map[string]core.RaftClient)
-	for _, node := range cluster.GetNodes() {
-		endpoint := node.GetEndpoint()
-		if endpoint != cluster.GetLocalNode().GetEndpoint() {
-			c, err := rpc.NewRaftGRPCClient(rpc.RaftGRPCClientConfig{
+	for _, endpoint := range cluster.Endpoints {
+		if endpoint != cluster.LocalEndpoint {
+			c, err := net.NewRaftGRPCClient(net.RaftGRPCClientConfig{
 				Endpoint: endpoint,
 			})
 			if err != nil {
@@ -110,8 +108,8 @@ func main() {
 		sm.Run(context.Background())
 	}()
 
-	server := rpc.NewRaftGRPCServer(rpc.RaftGRPCServerConfig{
-		Endpoint:     cluster.GetLocalNode().GetEndpoint(),
+	server := net.NewRaftGRPCServer(net.RaftGRPCServerConfig{
+		Endpoint:     cluster.LocalEndpoint,
 		StateMachine: sm,
 	})
 	go func() {

@@ -1,4 +1,4 @@
-package rpc
+package net
 
 import (
 	"context"
