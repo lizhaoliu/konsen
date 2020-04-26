@@ -85,7 +85,7 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 	sm := &StateMachine{
 		msgCh:           make(chan interface{}),
 		stopCh:          make(chan struct{}),
-		timerGateCh:     make(chan struct{}),
+		timerGateCh:     make(chan struct{}, 1),
 		heartbeatGateCh: make(chan struct{}),
 		resetTimerCh:    make(chan struct{}),
 
@@ -500,7 +500,7 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	sm.numVotes++
 
 	// 3. Reset election timer.
-	sm.resetTimerCh <- struct{}{}
+	sm.timerGateCh <- struct{}{}
 
 	// 4. Send RequestVote RPCs to all other servers.
 	if err := sm.sendVoteRequests(context.Background()); err != nil {
@@ -562,7 +562,6 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 						log.Fatalf("%v", err)
 					}
 				case electionTimeout:
-					log.Infof("Election timeout occurs.")
 					if err := sm.handleElectionTimeout(); err != nil {
 						log.Fatalf("%v", err)
 					}
@@ -580,13 +579,13 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 
 // startElectionLoop starts the election timeout monitoring loop.
 func (sm *StateMachine) startElectionLoop(ctx context.Context) {
+	sm.timerGateCh <- struct{}{}
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
 
-		// Election timer worker.
 		for {
-			// Waits for signal.
+			// Waits for gate signal to start a new round of election timeout countdown.
 			<-sm.timerGateCh
 
 			timer := time.NewTimer(sm.nextTimeout())
@@ -596,11 +595,11 @@ func (sm *StateMachine) startElectionLoop(ctx context.Context) {
 			case <-sm.stopCh:
 				return
 			case <-sm.resetTimerCh:
+				// Start the next round of timeout.
 				timer.Stop()
 				continue
 			case <-timer.C:
-				// Election timeout happens here.
-				log.Traceln("Election timeout occurs.")
+				log.Warnf("Election timeout occurs.")
 				sm.msgCh <- electionTimeout{}
 			}
 		}

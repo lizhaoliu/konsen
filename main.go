@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,11 +21,13 @@ import (
 var (
 	clusterConfigPath string
 	dbFilePath        string
+	pprofPort         int
 )
 
 func init() {
 	flag.StringVar(&clusterConfigPath, "cluster_config_path", "", "Cluster configuration file path.")
 	flag.StringVar(&dbFilePath, "db_file_path", "", "Local DB file path.")
+	flag.IntVar(&pprofPort, "pprof_port", 0, "pprof HTTP server port, 0 means no pprof.")
 	flag.Parse()
 
 	if clusterConfigPath == "" {
@@ -101,6 +106,9 @@ func main() {
 	if err != nil {
 		logrus.Fatalf("Failed to create state machine: %v", err)
 	}
+	go func() {
+		sm.Run(context.Background())
+	}()
 
 	server := rpc.NewRaftGRPCServer(rpc.RaftGRPCServerConfig{
 		Endpoint:     cluster.GetLocalNode().GetEndpoint(),
@@ -109,6 +117,14 @@ func main() {
 	go func() {
 		server.Serve()
 	}()
+
+	if pprofPort > 0 {
+		go func() {
+			if err := http.ListenAndServe(fmt.Sprintf(":%d", pprofPort), nil); err != nil {
+				logrus.Errorf("Failed to start pprof server: %v", err)
+			}
+		}()
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
