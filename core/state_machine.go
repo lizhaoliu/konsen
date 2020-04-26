@@ -43,6 +43,8 @@ type StateMachine struct {
 	// Cluster info.
 	cluster *konsen.Cluster
 	clients map[string]RaftClient
+
+	wg sync.WaitGroup
 }
 
 // StateMachineConfig
@@ -104,11 +106,9 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 
 // Run starts the state machine and blocks until done.
 func (sm *StateMachine) Run(ctx context.Context) {
-	var wg sync.WaitGroup
-	sm.startMessageLoop(ctx, &wg)
-	sm.startElectionLoop(ctx, &wg)
-	sm.startHeartbeatLoop(ctx, &wg)
-	wg.Wait()
+	sm.startMessageLoop(ctx)
+	sm.startElectionLoop(ctx)
+	sm.wg.Wait()
 }
 
 // AppendEntries puts the incoming AppendEntries request in main message channel and waits for result.
@@ -387,7 +387,7 @@ func (sm *StateMachine) becomeLeader(term uint64) error {
 		sm.matchIndex[c] = 0
 	}
 
-	// TODO: If last log index ≥ nextIndex for a follower, send AppendEntries RPC with log entries starting at nextIndex.
+	sm.startHeartbeatLoop(context.Background())
 
 	return nil
 }
@@ -520,10 +520,10 @@ func (sm *StateMachine) handleElectionTimeout() error {
 }
 
 // startMessageLoop starts the main message loop.
-func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup) {
-	wg.Add(1)
+func (sm *StateMachine) startMessageLoop(ctx context.Context) {
+	sm.wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer sm.wg.Done()
 
 		for {
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
@@ -579,10 +579,10 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 }
 
 // startElectionLoop starts the election timeout monitoring loop.
-func (sm *StateMachine) startElectionLoop(ctx context.Context, wg *sync.WaitGroup) {
-	wg.Add(1)
+func (sm *StateMachine) startElectionLoop(ctx context.Context) {
+	sm.wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer sm.wg.Done()
 
 		// Election timer worker.
 		for {
@@ -608,10 +608,10 @@ func (sm *StateMachine) startElectionLoop(ctx context.Context, wg *sync.WaitGrou
 }
 
 // startHeartbeatLoop starts the heartbeat loop.
-func (sm *StateMachine) startHeartbeatLoop(ctx context.Context, wg *sync.WaitGroup) {
-	wg.Add(1)
+func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
+	sm.wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer sm.wg.Done()
 
 		// Heartbeat worker.
 		ticker := time.NewTicker(defaultHeartbeat)
@@ -623,10 +623,11 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context, wg *sync.WaitGro
 			case <-sm.stopCh:
 				return
 			case <-ticker.C:
-				// TODO: send out heartbeat.
+				// TODO: potential data race, use a channel to signal role change.
 				if sm.role != konsen.Role_LEADER {
-					continue
+					return
 				}
+				sm.msgCh <- appendEntriesSignal{}
 			}
 		}
 	}()
