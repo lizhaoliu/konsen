@@ -305,8 +305,8 @@ func TestBoltDB_PutLog(t *testing.T) {
 				filePath: tt.fields.filePath,
 				db:       tt.fields.db,
 			}
-			if err := b.PutLog(tt.args.log); (err != nil) != tt.wantErr {
-				t.Errorf("PutLog() error = %v, wantErr %v", err, tt.wantErr)
+			if err := b.WriteLog(tt.args.log); (err != nil) != tt.wantErr {
+				t.Errorf("WriteLog() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -334,8 +334,8 @@ func TestBoltDB_PutLogs(t *testing.T) {
 				filePath: tt.fields.filePath,
 				db:       tt.fields.db,
 			}
-			if err := b.PutLogs(tt.args.logs); (err != nil) != tt.wantErr {
-				t.Errorf("PutLogs() error = %v, wantErr %v", err, tt.wantErr)
+			if err := b.WriteLogs(tt.args.logs); (err != nil) != tt.wantErr {
+				t.Errorf("WriteLogs() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

@@ -18,7 +18,7 @@ const (
 	defaultHeartbeat   = 40 * time.Millisecond
 )
 
-// StateMachine is the state machine that implements Raft algorithm.
+// StateMachine is the state machine that implements Raft algorithm: https://raft.github.io/raft.pdf.
 type StateMachine struct {
 	msgCh           chan interface{} // Message channel.
 	stopCh          chan struct{}    // Signals to stop the state machine.
@@ -58,6 +58,12 @@ type appendEntriesWrap struct {
 	ch  chan<- *konsen.AppendEntriesResp
 }
 
+type appendEntriesRespWrap struct {
+	resp     *konsen.AppendEntriesResp
+	req      *konsen.AppendEntriesReq
+	endpoint string
+}
+
 type requestVoteWrap struct {
 	req *konsen.RequestVoteReq
 	ch  chan<- *konsen.RequestVoteResp
@@ -65,6 +71,9 @@ type requestVoteWrap struct {
 
 // electionTimeout represents a signal for election timeout event.
 type electionTimeout struct{}
+
+// appendEntriesSignal represents a signal to send AppendEntries request to all nodes.
+type appendEntriesSignal struct{}
 
 // NewStateMachine
 func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
@@ -161,19 +170,19 @@ func (sm *StateMachine) maybeUpdateCurrentTerm(otherTerm uint64) (uint64, error)
 	return currentTerm, nil
 }
 
-func (sm *StateMachine) handleAppendEntries(v appendEntriesWrap) error {
+func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch chan<- *konsen.AppendEntriesResp) error {
 	sm.resetTimerCh <- struct{}{}
 	defer func() { sm.timerGateCh <- struct{}{} }()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
-	currentTerm, err := sm.maybeUpdateCurrentTerm(v.req.GetTerm())
+	currentTerm, err := sm.maybeUpdateCurrentTerm(req.GetTerm())
 	if err != nil {
 		return err
 	}
 
 	// 1. Reply false if term < currentTerm.
-	if v.req.GetTerm() < currentTerm {
-		v.ch <- &konsen.AppendEntriesResp{
+	if req.GetTerm() < currentTerm {
+		ch <- &konsen.AppendEntriesResp{
 			Term:    currentTerm,
 			Success: false,
 		}
@@ -181,12 +190,12 @@ func (sm *StateMachine) handleAppendEntries(v appendEntriesWrap) error {
 	}
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
-	prevLog, err := sm.storage.GetLog(v.req.GetPrevLogIndex())
+	prevLogTerm, err := sm.storage.GetLogTerm(req.GetPrevLogIndex())
 	if err != nil {
-		return fmt.Errorf("failed to get log at index %d: %v", v.req.GetPrevLogIndex(), err)
+		return fmt.Errorf("failed to get log at index %d: %v", req.GetPrevLogIndex(), err)
 	}
-	if prevLog != nil && prevLog.GetTerm() != v.req.GetPrevLogTerm() {
-		v.ch <- &konsen.AppendEntriesResp{
+	if prevLogTerm != req.GetPrevLogTerm() {
+		ch <- &konsen.AppendEntriesResp{
 			Term:    currentTerm,
 			Success: false,
 		}
@@ -194,26 +203,33 @@ func (sm *StateMachine) handleAppendEntries(v appendEntriesWrap) error {
 	}
 
 	// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it.
-	for _, newLog := range v.req.GetEntries() {
+	startIdx := 0
+	for i, newLog := range req.GetEntries() {
 		localLog, err := sm.storage.GetLog(newLog.GetIndex())
 		if err != nil {
 			return fmt.Errorf("failed to get log at index %d: %v", newLog.GetIndex(), err)
 		}
-		if localLog != nil && localLog.GetTerm() != newLog.GetTerm() {
+		if localLog == nil {
+			startIdx = i
+			break
+		}
+		if localLog.GetTerm() != newLog.GetTerm() {
 			if err := sm.storage.DeleteLogs(newLog.GetIndex()); err != nil {
 				return fmt.Errorf("failed to delete logs with min index %d: %v", newLog.GetIndex(), err)
 			}
+			startIdx = i
+			break
 		}
 	}
 
 	// 4. Append any new entries not already in the log.
-	if err := sm.storage.PutLogs(v.req.GetEntries()); err != nil {
-		return fmt.Errorf("failed to store logs: %v", err)
+	if err := sm.storage.WriteLogs(req.GetEntries()[startIdx:]); err != nil {
+		return fmt.Errorf("failed to write logs: %v", err)
 	}
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
-	if v.req.GetLeaderCommit() > sm.commitIndex {
-		sm.commitIndex = v.req.GetLeaderCommit()
+	if req.GetLeaderCommit() > sm.commitIndex {
+		sm.commitIndex = req.GetLeaderCommit()
 		lastLogIndex, err := sm.storage.LastLogIndex()
 		if err != nil {
 			return fmt.Errorf("failed to get index of the last log: %v", err)
@@ -224,7 +240,7 @@ func (sm *StateMachine) handleAppendEntries(v appendEntriesWrap) error {
 	}
 
 	// Reply with success.
-	v.ch <- &konsen.AppendEntriesResp{
+	ch <- &konsen.AppendEntriesResp{
 		Term:    currentTerm,
 		Success: true,
 	}
@@ -232,7 +248,10 @@ func (sm *StateMachine) handleAppendEntries(v appendEntriesWrap) error {
 	return nil
 }
 
-func (sm *StateMachine) handleAppendEntriesResp(resp *konsen.AppendEntriesResp) error {
+func (sm *StateMachine) handleAppendEntriesResp(
+	resp *konsen.AppendEntriesResp,
+	req *konsen.AppendEntriesReq,
+	endpoint string) error {
 	sm.resetTimerCh <- struct{}{}
 	defer func() { sm.timerGateCh <- struct{}{} }()
 
@@ -242,22 +261,39 @@ func (sm *StateMachine) handleAppendEntriesResp(resp *konsen.AppendEntriesResp) 
 		return fmt.Errorf("%v", err)
 	}
 
+	// Terminate if no longer a leader.
+	if sm.role != konsen.Role_LEADER {
+		return nil
+	}
+
+	if resp.GetSuccess() {
+		// Successful: update nextIndex and matchIndex for follower.
+		sm.nextIndex[endpoint] = req.GetPrevLogIndex() + uint64(len(req.GetEntries())) + 1
+		sm.matchIndex[endpoint] = req.GetPrevLogIndex() + uint64(len(req.GetEntries()))
+	} else {
+		// AppendEntries fails because of log inconsistency: decrement nextIndex and retry.
+		sm.nextIndex[endpoint]--
+	}
+
+	// TODO: If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
+	// and log[N].term == currentTerm: set commitIndex = N.
+
 	return nil
 }
 
-func (sm *StateMachine) handleRequestVote(v requestVoteWrap) error {
+func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- *konsen.RequestVoteResp) error {
 	sm.resetTimerCh <- struct{}{}
 	defer func() { sm.timerGateCh <- struct{}{} }()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
-	currentTerm, err := sm.maybeUpdateCurrentTerm(v.req.GetTerm())
+	currentTerm, err := sm.maybeUpdateCurrentTerm(req.GetTerm())
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
 
 	// 1. Reply false if term < currentTerm.
-	if v.req.GetTerm() < currentTerm {
-		v.ch <- &konsen.RequestVoteResp{
+	if req.GetTerm() < currentTerm {
+		ch <- &konsen.RequestVoteResp{
 			Term:        currentTerm,
 			VoteGranted: false,
 		}
@@ -270,9 +306,9 @@ func (sm *StateMachine) handleRequestVote(v requestVoteWrap) error {
 		return fmt.Errorf("failed to get votedFor: %v", err)
 	}
 	// If not yet voted for anyone or already voted for this candidate.
-	if votedFor == "" || votedFor == v.req.GetCandidateId() {
-		if err := sm.grantVote(currentTerm, v.req.GetCandidateId(), v.ch); err != nil {
-			return fmt.Errorf("failed to grant vote to %q: %v", v.req.GetCandidateId(), err)
+	if votedFor == "" || votedFor == req.GetCandidateId() {
+		if err := sm.grantVote(currentTerm, req.GetCandidateId(), ch); err != nil {
+			return fmt.Errorf("failed to grant vote to %q: %v", req.GetCandidateId(), err)
 		}
 		return nil
 	}
@@ -283,8 +319,8 @@ func (sm *StateMachine) handleRequestVote(v requestVoteWrap) error {
 	if err != nil {
 		return fmt.Errorf("failed to get last log's term: %v", err)
 	}
-	if v.req.GetLastLogTerm() > lastLogTerm {
-		if err := sm.grantVote(currentTerm, v.req.GetCandidateId(), v.ch); err != nil {
+	if req.GetLastLogTerm() > lastLogTerm {
+		if err := sm.grantVote(currentTerm, req.GetCandidateId(), ch); err != nil {
 			return fmt.Errorf("failed to grant vote: %v", err)
 		}
 		return nil
@@ -295,15 +331,15 @@ func (sm *StateMachine) handleRequestVote(v requestVoteWrap) error {
 	if err != nil {
 		return fmt.Errorf("failed to get last log's index: %v", err)
 	}
-	if v.req.GetLastLogTerm() == lastLogTerm && v.req.GetLastLogIndex() >= lastLogIndex {
-		if err := sm.grantVote(currentTerm, v.req.GetCandidateId(), v.ch); err != nil {
+	if req.GetLastLogTerm() == lastLogTerm && req.GetLastLogIndex() >= lastLogIndex {
+		if err := sm.grantVote(currentTerm, req.GetCandidateId(), ch); err != nil {
 			return fmt.Errorf("failed to grant vote: %v", err)
 		}
 		return nil
 	}
 
 	// The candidate's log is not as up-to-date as receiver's, deny the vote.
-	v.ch <- &konsen.RequestVoteResp{
+	ch <- &konsen.RequestVoteResp{
 		Term:        currentTerm,
 		VoteGranted: false,
 	}
@@ -316,7 +352,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 	defer func() { sm.timerGateCh <- struct{}{} }()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
-	_, err := sm.maybeUpdateCurrentTerm(resp.GetTerm())
+	currentTerm, err := sm.maybeUpdateCurrentTerm(resp.GetTerm())
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -329,9 +365,30 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 		sm.numVotes++
 		// If votes received from majority of servers, become leader.
 		if sm.numVotes > len(sm.cluster.GetNodes())/2 {
-			// TODO: convert to leader.
+			if err := sm.becomeLeader(currentTerm); err != nil {
+				return fmt.Errorf("failed to become leader: %v", err)
+			}
 		}
 	}
+
+	return nil
+}
+
+func (sm *StateMachine) becomeLeader(term uint64) error {
+	log.Infof("%q has become leader for term %d.", sm.cluster.GetLocalNode().GetEndpoint(), term)
+	sm.role = konsen.Role_LEADER
+	lastLogIndex, err := sm.storage.LastLogIndex()
+	if err != nil {
+		return err
+	}
+	for c := range sm.nextIndex {
+		sm.nextIndex[c] = lastLogIndex + 1
+	}
+	for c := range sm.matchIndex {
+		sm.matchIndex[c] = 0
+	}
+
+	// TODO: If last log index ≥ nextIndex for a follower, send AppendEntries RPC with log entries starting at nextIndex.
 
 	return nil
 }
@@ -359,8 +416,7 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 		endpoint := node.GetEndpoint()
 		if endpoint != sm.cluster.GetLocalNode().GetEndpoint() {
 			go func() {
-				client := sm.clients[endpoint]
-				resp, err := client.RequestVote(ctx, req)
+				resp, err := sm.clients[endpoint].RequestVote(ctx, req)
 				if err != nil {
 					log.Errorf("Failed to send RequestVote to %q: %v", endpoint, err)
 				}
@@ -371,6 +427,57 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 			}()
 		}
 	}
+	return nil
+}
+
+func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
+	if sm.role != konsen.Role_LEADER {
+		return nil
+	}
+
+	currentTerm, err := sm.storage.GetCurrentTerm()
+	if err != nil {
+		return fmt.Errorf("failed to get current term: %v", err)
+	}
+
+	for _, node := range sm.cluster.GetNodes() {
+		endpoint := node.GetEndpoint()
+		if endpoint != sm.cluster.GetLocalNode().GetEndpoint() {
+			prevLogIndex := sm.nextIndex[endpoint] - 1
+			prevLogTerm, err := sm.storage.GetLogTerm(prevLogIndex)
+			if err != nil {
+				return fmt.Errorf("failed to get log term at index %d: %v", prevLogIndex, err)
+			}
+			entries, err := sm.storage.GetLogs(sm.nextIndex[endpoint])
+			if err != nil {
+				return fmt.Errorf("failed to get logs from index %d: %v", sm.nextIndex[endpoint], err)
+			}
+			req := &konsen.AppendEntriesReq{
+				Term:         currentTerm,
+				LeaderId:     sm.cluster.GetLocalNode().GetEndpoint(),
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: sm.commitIndex,
+			}
+
+			go func() {
+				resp, err := sm.clients[endpoint].AppendEntries(ctx, req)
+				if err != nil {
+					log.Errorf("Failed to send AppendEntries to %q: %v", endpoint, err)
+				}
+				select {
+				case sm.msgCh <- appendEntriesRespWrap{
+					resp:     resp,
+					req:      req,
+					endpoint: endpoint,
+				}:
+				case <-sm.stopCh:
+				}
+			}()
+		}
+	}
+
 	return nil
 }
 
@@ -438,15 +545,17 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 
 				switch v := msg.(type) {
 				case appendEntriesWrap:
-					if err := sm.handleAppendEntries(v); err != nil {
+					// Process incoming AppendEntries request.
+					if err := sm.handleAppendEntries(v.req, v.ch); err != nil {
 						log.Fatalf("%v", err)
 					}
 				case requestVoteWrap:
-					if err := sm.handleRequestVote(v); err != nil {
+					// Process incoming RequestVote request.
+					if err := sm.handleRequestVote(v.req, v.ch); err != nil {
 						log.Fatalf("%v", err)
 					}
-				case *konsen.AppendEntriesResp:
-					if err := sm.handleAppendEntriesResp(v); err != nil {
+				case appendEntriesRespWrap:
+					if err := sm.handleAppendEntriesResp(v.resp, v.req, v.endpoint); err != nil {
 						log.Fatalf("%v", err)
 					}
 				case *konsen.RequestVoteResp:
@@ -456,6 +565,10 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context, wg *sync.WaitGroup
 				case electionTimeout:
 					log.Infof("Election timeout occurs.")
 					if err := sm.handleElectionTimeout(); err != nil {
+						log.Fatalf("%v", err)
+					}
+				case appendEntriesSignal:
+					if err := sm.sendAppendEntries(context.Background()); err != nil {
 						log.Fatalf("%v", err)
 					}
 				default:

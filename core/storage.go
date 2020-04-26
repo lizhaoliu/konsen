@@ -19,11 +19,17 @@ type Storage interface {
 	// GetLog returns the log entry on given index.
 	GetLog(logIndex uint64) (*konsen.Log, error)
 
-	// PutLog stores the given log entry into storage.
-	PutLog(log *konsen.Log) error
+	// GetLogs returns log entries with index greater equal than given index.
+	GetLogs(minLogIndex uint64) ([]*konsen.Log, error)
 
-	// PutLogs stores the given log entries into storage.
-	PutLogs(logs []*konsen.Log) error
+	// GetLogTerm returns the log term at given index.
+	GetLogTerm(logIndex uint64) (uint64, error)
+
+	// WriteLog stores the given log entry into storage.
+	WriteLog(log *konsen.Log) error
+
+	// WriteLogs stores the given log entries into storage.
+	WriteLogs(logs []*konsen.Log) error
 
 	// FirstLogIndex returns the first(oldest) log entry's index.
 	FirstLogIndex() (uint64, error)

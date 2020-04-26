@@ -117,11 +117,40 @@ func (b *BoltDB) GetLog(logIndex uint64) (*konsen.Log, error) {
 	return log, nil
 }
 
-func (b *BoltDB) PutLog(log *konsen.Log) error {
-	return b.PutLogs([]*konsen.Log{log})
+func (b *BoltDB) GetLogs(minLogIndex uint64) ([]*konsen.Log, error) {
+	var logs []*konsen.Log
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(logsBucketName).Cursor()
+		for k, buf := c.Seek(uint64ToBytes(minLogIndex)); k != nil; k, buf = c.Next() {
+			log := &konsen.Log{}
+			if err := proto.Unmarshal(buf, log); err != nil {
+				return err
+			}
+			logs = append(logs, log)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return logs, nil
 }
 
-func (b *BoltDB) PutLogs(logs []*konsen.Log) error {
+func (b *BoltDB) GetLogTerm(logIndex uint64) (uint64, error) {
+	log, err := b.GetLog(logIndex)
+	if err != nil {
+		return 0, err
+	}
+	if log == nil {
+		return 0, nil
+	}
+	return log.GetTerm(), nil
+}
+
+func (b *BoltDB) WriteLog(log *konsen.Log) error {
+	return b.WriteLogs([]*konsen.Log{log})
+}
+
+func (b *BoltDB) WriteLogs(logs []*konsen.Log) error {
 	if len(logs) == 0 {
 		return nil
 	}
