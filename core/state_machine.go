@@ -417,7 +417,7 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 			go func() {
 				resp, err := sm.clients[endpoint].RequestVote(ctx, req)
 				if err != nil {
-					log.Errorf("Failed to send RequestVote to %q: %v", endpoint, err)
+					log.Debug("Failed to send RequestVote to %q: %v", endpoint, err)
 				}
 				select {
 				case sm.msgCh <- resp:
@@ -463,7 +463,7 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 			go func() {
 				resp, err := sm.clients[endpoint].AppendEntries(ctx, req)
 				if err != nil {
-					log.Errorf("Failed to send AppendEntries to %q: %v", endpoint, err)
+					log.Debug("Failed to send AppendEntries to %q: %v", endpoint, err)
 				}
 				select {
 				case sm.msgCh <- appendEntriesRespWrap{
