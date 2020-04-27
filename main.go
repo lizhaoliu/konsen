@@ -37,6 +37,9 @@ func init() {
 	}
 
 	logrus.SetOutput(os.Stdout)
+	logrus.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
 	logrus.SetLevel(logrus.InfoLevel)
 }
 
@@ -50,10 +53,16 @@ func parseClusterConfig(configFilePath string) (*core.ClusterConfig, error) {
 		return nil, fmt.Errorf("failed to unmarshal cluster config file: %v", err)
 	}
 
+	if cluster.LocalEndpoint == "" {
+		return nil, fmt.Errorf("local endpoint/address is unspecified")
+	}
+
 	numNodes := len(cluster.Endpoints)
 	if numNodes%2 != 1 {
 		return nil, fmt.Errorf("number of nodes in a cluster must be odd, got: %d", numNodes)
 	}
+
+	logrus.Infof("Cluster endpoints: %q", cluster.Endpoints)
 
 	for _, endpoint := range cluster.Endpoints {
 		if cluster.LocalEndpoint == endpoint {
@@ -104,9 +113,6 @@ func main() {
 	if err != nil {
 		logrus.Fatalf("Failed to create state machine: %v", err)
 	}
-	go func() {
-		sm.Run(context.Background())
-	}()
 
 	server := net.NewRaftGRPCServer(net.RaftGRPCServerConfig{
 		Endpoint:     cluster.LocalEndpoint,
@@ -114,6 +120,9 @@ func main() {
 	})
 	go func() {
 		server.Serve()
+	}()
+	go func() {
+		sm.Run(context.Background())
 	}()
 
 	if pprofPort > 0 {

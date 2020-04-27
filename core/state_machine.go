@@ -13,17 +13,16 @@ import (
 
 const (
 	defaultMinTimeout  = 500 * time.Millisecond
-	defaultTimeoutSpan = int64(500)
-	defaultHeartbeat   = 40 * time.Millisecond
+	defaultTimeoutSpan = 500 * time.Millisecond
+	defaultHeartbeat   = 50 * time.Millisecond
 )
 
 // StateMachine is the state machine that implements Raft algorithm: https://raft.github.io/raft.pdf.
 type StateMachine struct {
-	msgCh           chan interface{} // Message channel.
-	stopCh          chan struct{}    // Signals to stop the state machine.
-	timerGateCh     chan struct{}    // Signals to run next round of election timeout.
-	heartbeatGateCh chan struct{}    //
-	resetTimerCh    chan struct{}    // Signals to reset election timer, in case of receiving AppendEntries or RequestVote.
+	msgCh        chan interface{} // Message channel.
+	stopCh       chan struct{}    // Signals to stop the state machine.
+	timerGateCh  chan struct{}    // Signals to run next round of election timeout.
+	resetTimerCh chan struct{}    // Signals to reset election timer, in case of receiving AppendEntries or RequestVote.
 
 	// Persistent state storage on all servers.
 	storage Storage
@@ -83,11 +82,10 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 	}
 
 	sm := &StateMachine{
-		msgCh:           make(chan interface{}),
-		stopCh:          make(chan struct{}),
-		timerGateCh:     make(chan struct{}, 1),
-		heartbeatGateCh: make(chan struct{}),
-		resetTimerCh:    make(chan struct{}),
+		msgCh:        make(chan interface{}),
+		stopCh:       make(chan struct{}),
+		timerGateCh:  make(chan struct{}, 1),
+		resetTimerCh: make(chan struct{}),
 
 		storage: config.Storage,
 		cluster: config.Cluster,
@@ -151,20 +149,27 @@ func (sm *StateMachine) grantVote(term uint64, candidateID string, ch chan<- *ko
 		Term:        term,
 		VoteGranted: true,
 	}
+	log.Debug("Granted vote for candidate %q for term %d", candidateID, term)
 	return nil
 }
 
-func (sm *StateMachine) maybeUpdateCurrentTerm(otherTerm uint64) (uint64, error) {
+// maybeBecomeFollower checks if the given term is greater than current term, if true then update current term to
+// the given term and become a follower, otherwise it simply returns the current term.
+func (sm *StateMachine) maybeBecomeFollower(term uint64) (uint64, error) {
 	currentTerm, err := sm.storage.GetCurrentTerm()
 	if err != nil {
 		return 0, fmt.Errorf("failed to get current term: %v", err)
 	}
-	if otherTerm > currentTerm {
-		if err := sm.storage.SetCurrentTerm(otherTerm); err != nil {
-			return 0, fmt.Errorf("failed to set current term to %d: %v", otherTerm, err)
+	// If given term is greater than current term, update current term and become a follower.
+	if term > currentTerm {
+		if err := sm.storage.SetCurrentTerm(term); err != nil {
+			return 0, fmt.Errorf("failed to set current term to %d: %v", term, err)
 		}
-		currentTerm = otherTerm
+		currentTerm = term
 		sm.role = konsen.Role_FOLLOWER
+		if err := sm.storage.SetVotedFor(""); err != nil {
+			return currentTerm, fmt.Errorf("failed to reset voted for: %v", err)
+		}
 	}
 	return currentTerm, nil
 }
@@ -174,7 +179,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 	defer func() { sm.timerGateCh <- struct{}{} }()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
-	currentTerm, err := sm.maybeUpdateCurrentTerm(req.GetTerm())
+	currentTerm, err := sm.maybeBecomeFollower(req.GetTerm())
 	if err != nil {
 		return err
 	}
@@ -255,7 +260,7 @@ func (sm *StateMachine) handleAppendEntriesResp(
 	defer func() { sm.timerGateCh <- struct{}{} }()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
-	_, err := sm.maybeUpdateCurrentTerm(resp.GetTerm())
+	_, err := sm.maybeBecomeFollower(resp.GetTerm())
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -285,7 +290,7 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- 
 	defer func() { sm.timerGateCh <- struct{}{} }()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
-	currentTerm, err := sm.maybeUpdateCurrentTerm(req.GetTerm())
+	currentTerm, err := sm.maybeBecomeFollower(req.GetTerm())
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -299,25 +304,40 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- 
 		return nil
 	}
 
+	// Now candidate's term == currentTerm.
+
 	// 2. If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote.
 	votedFor, err := sm.storage.GetVotedFor()
 	if err != nil {
 		return fmt.Errorf("failed to get votedFor: %v", err)
 	}
-	// If not yet voted for anyone or already voted for this candidate.
-	if votedFor == "" || votedFor == req.GetCandidateId() {
-		if err := sm.grantVote(currentTerm, req.GetCandidateId(), ch); err != nil {
-			return fmt.Errorf("failed to grant vote to %q: %v", req.GetCandidateId(), err)
+
+	// If already voted for another candidate, deny the vote.
+	if votedFor != "" && votedFor != req.GetCandidateId() {
+		ch <- &konsen.RequestVoteResp{
+			Term:        currentTerm,
+			VoteGranted: false,
 		}
 		return nil
 	}
 
 	// If candidate’s log is at least as up-to-date as receiver’s log, grant vote.
+
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
 	lastLogTerm, err := sm.storage.LastLogTerm()
 	if err != nil {
 		return fmt.Errorf("failed to get last log's term: %v", err)
 	}
+	// Candidate's last log term is older, deny the vote.
+	if req.GetLastLogTerm() < lastLogTerm {
+		ch <- &konsen.RequestVoteResp{
+			Term:        currentTerm,
+			VoteGranted: false,
+		}
+		return nil
+	}
+
+	// Candidate's last log term is newer, grant vote.
 	if req.GetLastLogTerm() > lastLogTerm {
 		if err := sm.grantVote(currentTerm, req.GetCandidateId(), ch); err != nil {
 			return fmt.Errorf("failed to grant vote: %v", err)
@@ -325,12 +345,12 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- 
 		return nil
 	}
 
-	// If the logs end with the same term, then whichever log is longer is more up-to-date.
+	// If last logs have the same term, then whichever log is longer is more up-to-date.
 	lastLogIndex, err := sm.storage.LastLogIndex()
 	if err != nil {
 		return fmt.Errorf("failed to get last log's index: %v", err)
 	}
-	if req.GetLastLogTerm() == lastLogTerm && req.GetLastLogIndex() >= lastLogIndex {
+	if req.GetLastLogIndex() >= lastLogIndex {
 		if err := sm.grantVote(currentTerm, req.GetCandidateId(), ch); err != nil {
 			return fmt.Errorf("failed to grant vote: %v", err)
 		}
@@ -351,7 +371,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 	defer func() { sm.timerGateCh <- struct{}{} }()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
-	currentTerm, err := sm.maybeUpdateCurrentTerm(resp.GetTerm())
+	currentTerm, err := sm.maybeBecomeFollower(resp.GetTerm())
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -374,7 +394,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 }
 
 func (sm *StateMachine) becomeLeader(term uint64) error {
-	log.Infof("%q has become leader for term %d.", sm.cluster.LocalEndpoint, term)
+	log.Infof("Term - %d, leader - %q.", term, sm.cluster.LocalEndpoint)
 	sm.role = konsen.Role_LEADER
 	lastLogIndex, err := sm.storage.LastLogIndex()
 	if err != nil {
@@ -413,6 +433,7 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 	}
 	for _, endpoint := range sm.cluster.Endpoints {
 		if endpoint != sm.cluster.LocalEndpoint {
+			endpoint := endpoint
 			go func() {
 				resp, err := sm.clients[endpoint].RequestVote(ctx, req)
 				if err != nil {
@@ -458,6 +479,7 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 				LeaderCommit: sm.commitIndex,
 			}
 
+			endpoint := endpoint
 			go func() {
 				resp, err := sm.clients[endpoint].AppendEntries(ctx, req)
 				if err != nil {
@@ -495,12 +517,16 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	}
 
 	// 2. Vote for self.
+	if err := sm.storage.SetVotedFor(sm.cluster.LocalEndpoint); err != nil {
+		return fmt.Errorf("failed to set votedFor: %v", err)
+	}
 	sm.numVotes++
 
 	// 3. Reset election timer.
 	sm.timerGateCh <- struct{}{}
 
 	// 4. Send RequestVote RPCs to all other servers.
+	log.Debug("Send RequestVote for term %d.", currentTerm)
 	if err := sm.sendVoteRequests(context.Background()); err != nil {
 		return fmt.Errorf("failed to send vote requests: %v", err)
 	}
@@ -632,7 +658,7 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
 
 // nextTimeout calculates the next election timeout duration.
 func (sm *StateMachine) nextTimeout() time.Duration {
-	timeout := rand.Int63n(defaultTimeoutSpan) + int64(defaultMinTimeout)
+	timeout := rand.Int63n(int64(defaultTimeoutSpan)) + int64(defaultMinTimeout)
 	return time.Duration(timeout)
 }
 
