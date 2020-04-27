@@ -215,27 +215,6 @@ func (b *BoltDB) LastLogIndex() (uint64, error) {
 	return index, nil
 }
 
-func (b *BoltDB) LastLogIndexAndTerm() (uint64, uint64, error) {
-	var index, term uint64
-	if err := b.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(logsBucketName).Cursor()
-		k, buf := c.Last()
-		if k == nil {
-			return nil
-		}
-		index = bytesToUint64(k)
-		log := &konsen.Log{}
-		if err := proto.Unmarshal(buf, log); err != nil {
-			return err
-		}
-		term = log.GetTerm()
-		return nil
-	}); err != nil {
-		return 0, 0, err
-	}
-	return index, term, nil
-}
-
 func (b *BoltDB) FirstLogTerm() (uint64, error) {
 	var term uint64
 	if err := b.db.View(func(tx *bolt.Tx) error {

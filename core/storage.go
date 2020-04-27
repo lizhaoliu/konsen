@@ -37,9 +37,6 @@ type Storage interface {
 	// LastLogIndex returns the last(newest) log entry's index.
 	LastLogIndex() (uint64, error)
 
-	// LastLogIndexAndTerm returns the last(newest) log entry's index and term.
-	LastLogIndexAndTerm() (uint64, uint64, error)
-
 	// FirstLogTerm returns the first(oldest) log entry's term.
 	FirstLogTerm() (uint64, error)
 

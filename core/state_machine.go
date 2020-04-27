@@ -260,7 +260,7 @@ func (sm *StateMachine) handleAppendEntriesResp(
 	defer func() { sm.timerGateCh <- struct{}{} }()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
-	_, err := sm.maybeBecomeFollower(resp.GetTerm())
+	currentTerm, err := sm.maybeBecomeFollower(resp.GetTerm())
 	if err != nil {
 		return fmt.Errorf("%v", err)
 	}
@@ -271,18 +271,45 @@ func (sm *StateMachine) handleAppendEntriesResp(
 	}
 
 	if resp.GetSuccess() {
+		numEntries := len(req.GetEntries())
+
+		// Pure heartbeat, can return now.
+		if numEntries == 0 {
+			return nil
+		}
+
 		// Successful: update nextIndex and matchIndex for follower.
-		sm.nextIndex[endpoint] = req.GetPrevLogIndex() + uint64(len(req.GetEntries())) + 1
-		sm.matchIndex[endpoint] = req.GetPrevLogIndex() + uint64(len(req.GetEntries()))
+		sm.nextIndex[endpoint] = req.GetPrevLogIndex() + uint64(numEntries) + 1
+		sm.matchIndex[endpoint] = req.GetPrevLogIndex() + uint64(numEntries)
+
+		// If there exists N: N > commitIndex && a majority of matchIndex[i] ≥ N && log[N].term == currentTerm, then set commitIndex = N.
+		for i := numEntries - 1; i >= 0; i-- {
+			idx := req.GetEntries()[i].GetIndex()
+			logTerm, err := sm.storage.GetLogTerm(idx)
+			if err != nil {
+				return fmt.Errorf("failed to get log term at index %d: %v", idx, err)
+			}
+			if idx > sm.commitIndex && sm.isLogOnMajority(idx) && logTerm == currentTerm {
+				sm.commitIndex = idx
+				break
+			}
+		}
 	} else {
 		// AppendEntries fails because of log inconsistency: decrement nextIndex and retry.
 		sm.nextIndex[endpoint]--
 	}
 
-	// TODO: If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
-	// and log[N].term == currentTerm: set commitIndex = N.
-
 	return nil
+}
+
+func (sm *StateMachine) isLogOnMajority(logIndex uint64) bool {
+	n := 1 // Already on this server.
+	for _, endpoint := range sm.cluster.Endpoints {
+		if endpoint != sm.cluster.LocalEndpoint && sm.matchIndex[endpoint] >= logIndex {
+			n++
+		}
+	}
+	return n > len(sm.cluster.Endpoints)/2
 }
 
 func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- *konsen.RequestVoteResp) error {
