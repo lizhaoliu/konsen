@@ -11,7 +11,7 @@ enum Role {
 }
 
 message Log {
-  uint64 index = 1; // Index of the log entry.
+  uint64 index = 1; // Index of the log entry (first index is 1).
   uint64 term = 2;  // Term of the log entry.
   bytes data = 3;   // Raw data that the log entry encapsulates.
 }

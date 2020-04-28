@@ -6,8 +6,8 @@ import (
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 )
 
-// RaftClient is a generic interface for Raft client.
-type RaftClient interface {
+// RaftService defines methods exposed by a Raft service.
+type RaftService interface {
 	// AppendEntries sends AppendEntries request to the remote server.
 	AppendEntries(ctx context.Context, in *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error)
 

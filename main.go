@@ -73,8 +73,8 @@ func parseClusterConfig(configFilePath string) (*core.ClusterConfig, error) {
 	return nil, fmt.Errorf("local server endpoint %q is not in cluster", cluster.LocalEndpoint)
 }
 
-func createClients(cluster *core.ClusterConfig) (map[string]core.RaftClient, error) {
-	clients := make(map[string]core.RaftClient)
+func createClients(cluster *core.ClusterConfig) (map[string]core.RaftService, error) {
+	clients := make(map[string]core.RaftService)
 	for _, endpoint := range cluster.Endpoints {
 		if endpoint != cluster.LocalEndpoint {
 			c, err := net.NewRaftGRPCClient(net.RaftGRPCClientConfig{

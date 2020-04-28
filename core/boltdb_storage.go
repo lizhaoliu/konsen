@@ -10,8 +10,11 @@ import (
 )
 
 var (
+	// Raft storage buckets.
 	logsBucketName   = []byte("logs")
 	statesBucketName = []byte("states")
+	// Additional buckets.
+	kvBucketName = []byte("kv")
 
 	currentTermKey = []byte("current_term")
 	votedForKey    = []byte("voted_for")
@@ -40,6 +43,11 @@ func NewBoltDB(config BoltDBConfig) (*BoltDB, error) {
 			return err
 		}
 		_, err = tx.CreateBucketIfNotExists(statesBucketName)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.CreateBucketIfNotExists(kvBucketName)
 		if err != nil {
 			return err
 		}
@@ -253,6 +261,30 @@ func (b *BoltDB) LastLogTerm() (uint64, error) {
 		return 0, err
 	}
 	return term, nil
+}
+
+func (b *BoltDB) SetValue(key []byte, value []byte) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(kvBucketName)
+		return b.Put(key, value)
+	})
+}
+
+func (b *BoltDB) GetValue(key []byte) ([]byte, error) {
+	var value []byte
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(kvBucketName)
+		buf := b.Get(key)
+		if buf == nil {
+			return nil
+		}
+		value = make([]byte, len(buf))
+		copy(value, buf)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return value, nil
 }
 
 func (b *BoltDB) Close() error {

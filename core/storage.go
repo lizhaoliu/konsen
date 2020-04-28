@@ -2,7 +2,7 @@ package core
 
 import konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 
-// Storage provides an interface for a set of persistent storage operations.
+// Storage provides an interface for a set of local persistent storage operations.
 type Storage interface {
 	// GetCurrentTerm returns the latest term server has seen (initialized to 0 on first boot, increases monotonically).
 	GetCurrentTerm() (uint64, error)
@@ -25,10 +25,10 @@ type Storage interface {
 	// GetLogTerm returns the log term at given index.
 	GetLogTerm(logIndex uint64) (uint64, error)
 
-	// WriteLog stores the given log entry into storage.
+	// WriteLog writes the given log entry into storage.
 	WriteLog(log *konsen.Log) error
 
-	// WriteLogs stores the given log entries into storage.
+	// WriteLogs writes the given log entries into storage.
 	WriteLogs(logs []*konsen.Log) error
 
 	// FirstLogIndex returns the first(oldest) log entry's index.
@@ -45,4 +45,12 @@ type Storage interface {
 
 	// DeleteLogsFrom deletes logs with index greater equal than given index.
 	DeleteLogsFrom(minLogIndex uint64) error
+
+	// Following methods are not required by Raft.
+
+	// SetValue stores a key-value pair.
+	SetValue(key []byte, value []byte) error
+
+	// GetValue returns value of a key.
+	GetValue(key []byte) ([]byte, error)
 }

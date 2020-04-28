@@ -31,7 +31,7 @@ type StateMachine struct {
 	commitIndex   uint64      // Index of highest log entry known to be committed (initialized to 0).
 	lastApplied   uint64      // Index of highest log entry applied to state machine (initialized to 0).
 	role          konsen.Role // Current role.
-	currentLeader string      // Current leader (if not this server) endpoint.
+	currentLeader string      // Current leader.
 
 	// Volatile state on candidates.
 	numVotes int
@@ -42,16 +42,30 @@ type StateMachine struct {
 
 	// ClusterConfig info.
 	cluster *ClusterConfig
-	clients map[string]RaftClient
+	clients map[string]RaftService
 
 	wg sync.WaitGroup
 }
 
 // StateMachineConfig
 type StateMachineConfig struct {
-	Storage Storage               // Local storage instance.
-	Cluster *ClusterConfig        // Cluster configuration.
-	Clients map[string]RaftClient // A map of {endpoint: client instance}.
+	Storage Storage                // Local storage instance.
+	Cluster *ClusterConfig         // Cluster configuration.
+	Clients map[string]RaftService // A map of {endpoint: client instance}.
+}
+
+// Snapshot is a snapshot of the internal state of a state machine.
+type Snapshot struct {
+	CurrentTerm   uint64            // Current term.
+	CommitIndex   uint64            // Index of highest log entry known to be committed.
+	LastApplied   uint64            // Index of highest log entry applied to state machine.
+	Role          konsen.Role       // Current role.
+	CurrentLeader string            // Current leader.
+	NextIndex     map[string]uint64 // For each server, index of the next log entry to send to that server (initialized to leader last log index + 1).
+	MatchIndex    map[string]uint64 // For each server, index of highest log entry known to be replicated on that server (initialized to 0, increases monotonically).
+	LogIndices    []uint64          // Logs indices.
+	LogTerms      []uint64          // Log terms.
+	LogSizes      []int             // Log binary sizes.
 }
 
 type appendEntriesWrap struct {
@@ -70,15 +84,21 @@ type requestVoteWrap struct {
 	ch  chan<- *konsen.RequestVoteResp
 }
 
-// electionTimeoutMsg represents a signal for election timeout event.
+// electionTimeoutMsg represents a message for election timeout event.
 type electionTimeoutMsg struct{}
 
-// appendEntriesMsg represents a signal to send AppendEntries request to all nodes.
+// appendEntriesMsg represents a message to send AppendEntries request to all nodes.
 type appendEntriesMsg struct{}
 
+// appendDataMsg represents a message to append given data into state machine.
 type appendDataMsg struct {
 	req *konsen.AppendDataReq
 	ch  chan<- *konsen.AppendDataResp
+}
+
+// getSnapshotMsg represents a message to generate a state snapshot.
+type getSnapshotMsg struct {
+	ch chan<- *Snapshot
 }
 
 // NewStateMachine
@@ -180,9 +200,17 @@ func (sm *StateMachine) maybeBecomeFollower(term uint64) (uint64, error) {
 	return currentTerm, nil
 }
 
-func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch chan<- *konsen.AppendEntriesResp) error {
+func (sm *StateMachine) resetElectionTimer() {
 	sm.resetTimerCh <- struct{}{}
-	defer func() { sm.timerGateCh <- struct{}{} }()
+}
+
+func (sm *StateMachine) openElectionTimerGate() {
+	sm.timerGateCh <- struct{}{}
+}
+
+func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch chan<- *konsen.AppendEntriesResp) error {
+	sm.resetElectionTimer()
+	defer sm.openElectionTimerGate()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(req.GetTerm())
@@ -208,6 +236,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 		return fmt.Errorf("failed to get log at index %d: %v", req.GetPrevLogIndex(), err)
 	}
 	if prevLogTerm != req.GetPrevLogTerm() {
+		log.Infof("Local prevLogTerm(%d) mismatches request prevLogTerm(%d).", prevLogTerm, req.GetPrevLogTerm())
 		ch <- &konsen.AppendEntriesResp{
 			Term:    currentTerm,
 			Success: false,
@@ -215,29 +244,35 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 		return nil
 	}
 
-	// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it.
-	startIdx := 0
-	for i, newLog := range req.GetEntries() {
-		localLog, err := sm.storage.GetLog(newLog.GetIndex())
-		if err != nil {
-			return fmt.Errorf("failed to get log at index %d: %v", newLog.GetIndex(), err)
-		}
-		if localLog == nil {
-			startIdx = i
-			break
-		}
-		if localLog.GetTerm() != newLog.GetTerm() {
-			if err := sm.storage.DeleteLogsFrom(newLog.GetIndex()); err != nil {
-				return fmt.Errorf("failed to delete logs from min index %d: %v", newLog.GetIndex(), err)
+	entries := req.GetEntries()
+	// If there are new logs to append.
+	if len(entries) > 0 {
+		// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it.
+		startIdx := 0
+		for i, newLog := range entries {
+			localLog, err := sm.storage.GetLog(newLog.GetIndex())
+			if err != nil {
+				return fmt.Errorf("failed to get log at index %d: %v", newLog.GetIndex(), err)
 			}
-			startIdx = i
-			break
+			if localLog == nil {
+				startIdx = i
+				break
+			}
+			if localLog.GetTerm() != newLog.GetTerm() {
+				log.Infof("Local logs conflict from index %d, now delete onwards.", newLog.GetIndex())
+				if err := sm.storage.DeleteLogsFrom(newLog.GetIndex()); err != nil {
+					return fmt.Errorf("failed to delete logs from min index %d: %v", newLog.GetIndex(), err)
+				}
+				startIdx = i
+				break
+			}
 		}
-	}
 
-	// 4. Append any new entries not already in the log.
-	if err := sm.storage.WriteLogs(req.GetEntries()[startIdx:]); err != nil {
-		return fmt.Errorf("failed to write logs: %v", err)
+		// 4. Append any new entries not already in the log.
+		log.Infof("Append logs from index %d.", entries[startIdx].GetIndex())
+		if err := sm.storage.WriteLogs(entries[startIdx:]); err != nil {
+			return fmt.Errorf("failed to write logs: %v", err)
+		}
 	}
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
@@ -250,6 +285,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 		if lastLogIndex < sm.commitIndex {
 			sm.commitIndex = lastLogIndex
 		}
+		log.Infof("leaderCommit > commitIndex, commitIndex(%d) = min(leaderCommit(%d), last log entry(%d)).", sm.commitIndex, req.GetLeaderCommit(), lastLogIndex)
 	}
 
 	// Reply with success.
@@ -265,8 +301,8 @@ func (sm *StateMachine) handleAppendEntriesResp(
 	resp *konsen.AppendEntriesResp,
 	req *konsen.AppendEntriesReq,
 	endpoint string) error {
-	sm.resetTimerCh <- struct{}{}
-	defer func() { sm.timerGateCh <- struct{}{} }()
+	sm.resetElectionTimer()
+	defer sm.openElectionTimerGate()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(resp.GetTerm())
@@ -282,7 +318,7 @@ func (sm *StateMachine) handleAppendEntriesResp(
 	if resp.GetSuccess() {
 		numEntries := len(req.GetEntries())
 
-		// Pure heartbeat, can return now.
+		// Response is from a pure heartbeat, can return now.
 		if numEntries == 0 {
 			return nil
 		}
@@ -323,8 +359,8 @@ func (sm *StateMachine) isLogOnMajority(logIndex uint64) bool {
 }
 
 func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- *konsen.RequestVoteResp) error {
-	sm.resetTimerCh <- struct{}{}
-	defer func() { sm.timerGateCh <- struct{}{} }()
+	sm.resetElectionTimer()
+	defer sm.openElectionTimerGate()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(req.GetTerm())
@@ -404,8 +440,8 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- 
 }
 
 func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) error {
-	sm.resetTimerCh <- struct{}{}
-	defer func() { sm.timerGateCh <- struct{}{} }()
+	sm.resetElectionTimer()
+	defer sm.openElectionTimerGate()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(resp.GetTerm())
@@ -433,6 +469,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 func (sm *StateMachine) becomeLeader(term uint64) error {
 	log.Infof("Term - %d, leader - %q.", term, sm.cluster.LocalEndpoint)
 	sm.role = konsen.Role_LEADER
+	sm.currentLeader = sm.cluster.LocalEndpoint
 	lastLogIndex, err := sm.storage.LastLogIndex()
 	if err != nil {
 		return err
@@ -541,6 +578,7 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	// If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate.
 	sm.role = konsen.Role_CANDIDATE
 	sm.numVotes = 0
+	sm.currentLeader = ""
 
 	// On conversion to candidate, start election:
 	// 1. Increment currentTerm.
@@ -548,6 +586,7 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	if err != nil {
 		return fmt.Errorf("failed to get current term: %v", err)
 	}
+	log.Debug("Term - %d: election timeout", currentTerm)
 	currentTerm++
 	if err := sm.storage.SetCurrentTerm(currentTerm); err != nil {
 		return fmt.Errorf("failed to set current term to %d: %v", currentTerm, err)
@@ -580,6 +619,22 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	return nil
 }
 
+func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) error {
+	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
+	for sm.commitIndex > sm.lastApplied {
+		sm.lastApplied++
+		logEntry, err := sm.storage.GetLog(sm.lastApplied)
+		if err != nil {
+			return fmt.Errorf("failed to get log at index %d", sm.lastApplied)
+		}
+		if err := applyCommand(logEntry.GetData()); err != nil {
+			return fmt.Errorf("failed to apply command from log at index %d", sm.lastApplied)
+		}
+		log.Infof("Applied log at index %d", sm.lastApplied)
+	}
+	return nil
+}
+
 // startMessageLoop starts the main message loop.
 func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 	sm.wg.Add(1)
@@ -588,9 +643,12 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 
 		for {
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
-			for sm.commitIndex > sm.lastApplied {
-				sm.lastApplied++
-				// TODO: apply log[lastApplied].
+			if err := sm.maybeApplyLogs(func(command []byte) error {
+				// TODO: this is a placeholder, make the function configurable by user.
+				log.Infof("Apply: %s", command)
+				return nil
+			}); err != nil {
+				log.Fatalf("%v", err)
 			}
 
 			select {
@@ -634,6 +692,10 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					if err := sm.handleAppendData(v.req, v.ch); err != nil {
 						log.Fatalf("%v", err)
 					}
+				case getSnapshotMsg:
+					if err := sm.handleGetSnapshot(v.ch); err != nil {
+						log.Fatalf("%v", err)
+					}
 				default:
 					log.Fatalf("Unrecognized message: %v", v)
 				}
@@ -664,7 +726,7 @@ func (sm *StateMachine) startElectionLoop(ctx context.Context) {
 				timer.Stop()
 				continue
 			case <-timer.C:
-				log.Warnf("Election timeout occurs.")
+				// Election timeout occurs.
 				sm.msgCh <- electionTimeoutMsg{}
 			}
 		}
@@ -754,6 +816,58 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 	}
 	log.Debug("Log written: index - %d, term - %d, bytes - %d.", newLog.GetIndex(), newLog.GetTerm(), len(newLog.GetData()))
 	ch <- &konsen.AppendDataResp{Success: true}
+	return nil
+}
+
+func (sm *StateMachine) GetSnapshot(ctx context.Context) (*Snapshot, error) {
+	ch := make(chan *Snapshot)
+	sm.msgCh <- getSnapshotMsg{ch: ch}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		return resp, nil
+	}
+}
+
+func (sm *StateMachine) handleGetSnapshot(ch chan<- *Snapshot) error {
+	currentTerm, err := sm.storage.GetCurrentTerm()
+	if err != nil {
+		return fmt.Errorf("failed to get current term: %v", err)
+	}
+	// TODO: in the future we don't need to get all logs, just for debug now.
+	logs, err := sm.storage.GetLogsFrom(1)
+	if err != nil {
+		return fmt.Errorf("failed to get logs: %v", err)
+	}
+	nextIndexMap := make(map[string]uint64)
+	for k, v := range sm.nextIndex {
+		nextIndexMap[k] = v
+	}
+	matchIndexMap := make(map[string]uint64)
+	for k, v := range sm.matchIndex {
+		matchIndexMap[k] = v
+	}
+	logIndices := make([]uint64, len(logs))
+	logTerms := make([]uint64, len(logs))
+	logSizes := make([]int, len(logs))
+	for i, e := range logs {
+		logIndices[i] = e.GetIndex()
+		logTerms[i] = e.GetTerm()
+		logSizes[i] = len(e.GetData())
+	}
+	ch <- &Snapshot{
+		CurrentTerm:   currentTerm,
+		CommitIndex:   sm.commitIndex,
+		LastApplied:   sm.lastApplied,
+		Role:          sm.role,
+		CurrentLeader: sm.currentLeader,
+		NextIndex:     nextIndexMap,
+		MatchIndex:    matchIndexMap,
+		LogIndices:    logIndices,
+		LogTerms:      logTerms,
+		LogSizes:      logSizes,
+	}
 	return nil
 }
 
