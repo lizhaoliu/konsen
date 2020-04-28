@@ -218,8 +218,8 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 			break
 		}
 		if localLog.GetTerm() != newLog.GetTerm() {
-			if err := sm.storage.DeleteLogs(newLog.GetIndex()); err != nil {
-				return fmt.Errorf("failed to delete logs with min index %d: %v", newLog.GetIndex(), err)
+			if err := sm.storage.DeleteLogsFrom(newLog.GetIndex()); err != nil {
+				return fmt.Errorf("failed to delete logs from min index %d: %v", newLog.GetIndex(), err)
 			}
 			startIdx = i
 			break
@@ -238,7 +238,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 		if err != nil {
 			return fmt.Errorf("failed to get index of the last log: %v", err)
 		}
-		if lastLogIndex > sm.commitIndex {
+		if lastLogIndex < sm.commitIndex {
 			sm.commitIndex = lastLogIndex
 		}
 	}
@@ -493,7 +493,7 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("failed to get log term at index %d: %v", prevLogIndex, err)
 			}
-			entries, err := sm.storage.GetLogs(sm.nextIndex[endpoint])
+			entries, err := sm.storage.GetLogsFrom(sm.nextIndex[endpoint])
 			if err != nil {
 				return fmt.Errorf("failed to get logs from index %d: %v", sm.nextIndex[endpoint], err)
 			}

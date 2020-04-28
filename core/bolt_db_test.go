@@ -55,8 +55,8 @@ func TestBoltDB_DeleteLogs(t *testing.T) {
 				filePath: tt.fields.filePath,
 				db:       tt.fields.db,
 			}
-			if err := b.DeleteLogs(tt.args.minLogIndex); (err != nil) != tt.wantErr {
-				t.Errorf("DeleteLogs() error = %v, wantErr %v", err, tt.wantErr)
+			if err := b.DeleteLogsFrom(tt.args.minLogIndex); (err != nil) != tt.wantErr {
+				t.Errorf("DeleteLogsFrom() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

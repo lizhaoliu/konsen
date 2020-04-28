@@ -117,7 +117,7 @@ func (b *BoltDB) GetLog(logIndex uint64) (*konsen.Log, error) {
 	return log, nil
 }
 
-func (b *BoltDB) GetLogs(minLogIndex uint64) ([]*konsen.Log, error) {
+func (b *BoltDB) GetLogsFrom(minLogIndex uint64) ([]*konsen.Log, error) {
 	var logs []*konsen.Log
 	if err := b.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(logsBucketName).Cursor()
@@ -171,7 +171,7 @@ func (b *BoltDB) WriteLogs(logs []*konsen.Log) error {
 	})
 }
 
-func (b *BoltDB) DeleteLogs(minLogIndex uint64) error {
+func (b *BoltDB) DeleteLogsFrom(minLogIndex uint64) error {
 	return b.db.Update(func(tx *bolt.Tx) error {
 		c := tx.Bucket(logsBucketName).Cursor()
 		for k, _ := c.Seek(uint64ToBytes(minLogIndex)); k != nil; k, _ = c.Next() {

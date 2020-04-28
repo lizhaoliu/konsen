@@ -19,8 +19,8 @@ type Storage interface {
 	// GetLog returns the log entry on given index.
 	GetLog(logIndex uint64) (*konsen.Log, error)
 
-	// GetLogs returns log entries with index greater equal than given index.
-	GetLogs(minLogIndex uint64) ([]*konsen.Log, error)
+	// GetLogsFrom returns log entries with index greater equal than given index.
+	GetLogsFrom(minLogIndex uint64) ([]*konsen.Log, error)
 
 	// GetLogTerm returns the log term at given index.
 	GetLogTerm(logIndex uint64) (uint64, error)
@@ -43,6 +43,6 @@ type Storage interface {
 	// LastLogTerm returns the last(newest) log entry's term.
 	LastLogTerm() (uint64, error)
 
-	// DeleteLogs deletes logs with index greater equal than given index.
-	DeleteLogs(minLogIndex uint64) error
+	// DeleteLogsFrom deletes logs with index greater equal than given index.
+	DeleteLogsFrom(minLogIndex uint64) error
 }
