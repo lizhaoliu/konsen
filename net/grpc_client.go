@@ -52,6 +52,10 @@ func (c *RaftGRPCClient) RequestVote(ctx context.Context, in *konsen.RequestVote
 	return c.client.RequestVote(ctx, in, grpc.WaitForReady(false))
 }
 
+func (c *RaftGRPCClient) AppendData(ctx context.Context, in *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
+	return c.client.AppendData(ctx, in, grpc.WaitForReady(false))
+}
+
 func (c *RaftGRPCClient) Close() error {
 	return c.conn.Close()
 }

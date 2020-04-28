@@ -13,4 +13,7 @@ type RaftClient interface {
 
 	// RequestVote sends RequestVote request to the remote server.
 	RequestVote(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error)
+
+	// AppendData sends AppendData request to the remote server.
+	AppendData(ctx context.Context, in *konsen.AppendDataReq) (*konsen.AppendDataResp, error)
 }

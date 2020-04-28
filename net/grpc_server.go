@@ -37,6 +37,10 @@ func (r *RaftGRPCServer) RequestVote(ctx context.Context, req *konsen.RequestVot
 	return r.sm.RequestVote(ctx, req)
 }
 
+func (r *RaftGRPCServer) AppendData(ctx context.Context, req *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
+	return r.sm.AppendData(ctx, req)
+}
+
 func (r *RaftGRPCServer) Serve() error {
 	logrus.Infof("Starting Raft server on: %q", r.endpoint)
 	lis, err := net.Listen("tcp", r.endpoint)

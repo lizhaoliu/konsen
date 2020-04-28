@@ -42,10 +42,21 @@ message RequestVoteResp {
   bool vote_granted = 2;  // True means candidate received vote.
 }
 
+message AppendDataReq {
+  bytes data = 1;
+}
+
+message AppendDataResp {
+  bool success = 1;
+}
+
 service Raft {
   // Sends "AppendEntries" request.
   rpc AppendEntries(AppendEntriesReq) returns (AppendEntriesResp) {}
 
   // Sends "RequestVote" request.
   rpc RequestVote(RequestVoteReq) returns (RequestVoteResp) {}
+
+  // Sends "AppendData" request.
+  rpc AppendData(AppendDataReq) returns (AppendDataResp) {}
 }

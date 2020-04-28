@@ -28,9 +28,10 @@ type StateMachine struct {
 	storage Storage
 
 	// Volatile state on all servers.
-	commitIndex uint64      // Index of highest log entry known to be committed.
-	lastApplied uint64      // Index of highest log entry applied to state machine.
-	role        konsen.Role // Current role.
+	commitIndex   uint64      // Index of highest log entry known to be committed (initialized to 0).
+	lastApplied   uint64      // Index of highest log entry applied to state machine (initialized to 0).
+	role          konsen.Role // Current role.
+	currentLeader string      // Current leader (if not this server) endpoint.
 
 	// Volatile state on candidates.
 	numVotes int
@@ -69,11 +70,16 @@ type requestVoteWrap struct {
 	ch  chan<- *konsen.RequestVoteResp
 }
 
-// electionTimeout represents a signal for election timeout event.
-type electionTimeout struct{}
+// electionTimeoutMsg represents a signal for election timeout event.
+type electionTimeoutMsg struct{}
 
-// appendEntriesSignal represents a signal to send AppendEntries request to all nodes.
-type appendEntriesSignal struct{}
+// appendEntriesMsg represents a signal to send AppendEntries request to all nodes.
+type appendEntriesMsg struct{}
+
+type appendDataMsg struct {
+	req *konsen.AppendDataReq
+	ch  chan<- *konsen.AppendDataResp
+}
 
 // NewStateMachine
 func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
@@ -193,6 +199,9 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 		return nil
 	}
 
+	// At this point, the request is coming from a legit leader.
+	sm.currentLeader = req.GetLeaderId()
+
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
 	prevLogTerm, err := sm.storage.GetLogTerm(req.GetPrevLogIndex())
 	if err != nil {
@@ -283,14 +292,15 @@ func (sm *StateMachine) handleAppendEntriesResp(
 		sm.matchIndex[endpoint] = req.GetPrevLogIndex() + uint64(numEntries)
 
 		// If there exists N: N > commitIndex && a majority of matchIndex[i] ≥ N && log[N].term == currentTerm, then set commitIndex = N.
+		// Only need to find the highest index, as lower index logs will always match if a higher one matches.
 		for i := numEntries - 1; i >= 0; i-- {
-			idx := req.GetEntries()[i].GetIndex()
-			logTerm, err := sm.storage.GetLogTerm(idx)
+			logIndex := req.GetEntries()[i].GetIndex()
+			logTerm, err := sm.storage.GetLogTerm(logIndex)
 			if err != nil {
-				return fmt.Errorf("failed to get log term at index %d: %v", idx, err)
+				return fmt.Errorf("failed to get log term at index %d: %v", logIndex, err)
 			}
-			if idx > sm.commitIndex && sm.isLogOnMajority(idx) && logTerm == currentTerm {
-				sm.commitIndex = idx
+			if logIndex > sm.commitIndex && sm.isLogOnMajority(logIndex) && logTerm == currentTerm {
+				sm.commitIndex = logIndex
 				break
 			}
 		}
@@ -612,12 +622,16 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					if err := sm.handleRequestVoteResp(v); err != nil {
 						log.Fatalf("%v", err)
 					}
-				case electionTimeout:
+				case electionTimeoutMsg:
 					if err := sm.handleElectionTimeout(); err != nil {
 						log.Fatalf("%v", err)
 					}
-				case appendEntriesSignal:
+				case appendEntriesMsg:
 					if err := sm.sendAppendEntries(context.Background()); err != nil {
+						log.Fatalf("%v", err)
+					}
+				case appendDataMsg:
+					if err := sm.handleAppendData(v.req, v.ch); err != nil {
 						log.Fatalf("%v", err)
 					}
 				default:
@@ -651,7 +665,7 @@ func (sm *StateMachine) startElectionLoop(ctx context.Context) {
 				continue
 			case <-timer.C:
 				log.Warnf("Election timeout occurs.")
-				sm.msgCh <- electionTimeout{}
+				sm.msgCh <- electionTimeoutMsg{}
 			}
 		}
 	}()
@@ -677,7 +691,7 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
 				if sm.role != konsen.Role_LEADER {
 					return
 				}
-				sm.msgCh <- appendEntriesSignal{}
+				sm.msgCh <- appendEntriesMsg{}
 			}
 		}
 	}()
@@ -687,6 +701,60 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
 func (sm *StateMachine) nextTimeout() time.Duration {
 	timeout := rand.Int63n(int64(defaultTimeoutSpan)) + int64(defaultMinTimeout)
 	return time.Duration(timeout)
+}
+
+func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
+	ch := make(chan *konsen.AppendDataResp)
+	sm.msgCh <- appendDataMsg{
+		req: req,
+		ch:  ch,
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-sm.stopCh:
+		return nil, fmt.Errorf("server has been stopped during the request")
+	case resp := <-ch:
+		return resp, nil
+	}
+}
+
+// handleAppendData processes a appendDataMsg.
+func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) error {
+	// Only leader writes data to its logs.
+	if sm.role != konsen.Role_LEADER {
+		// Forward the request to leader.
+		go func() {
+			ctx := context.Background()
+			resp, err := sm.clients[sm.currentLeader].AppendData(ctx, req)
+			if err != nil {
+				log.Debug("Failed to send AppendDataReq to leader %q: %v", sm.currentLeader, err)
+			}
+			ch <- resp
+		}()
+		return nil
+	}
+
+	lastLogIndex, err := sm.storage.LastLogIndex()
+	if err != nil {
+		return fmt.Errorf("failed to get last log index: %v", err)
+	}
+	currentTerm, err := sm.storage.GetCurrentTerm()
+	if err != nil {
+		return fmt.Errorf("failed to get current term: %v", err)
+	}
+	newLog := &konsen.Log{
+		Index: lastLogIndex + 1,
+		Term:  currentTerm,
+		Data:  req.GetData(),
+	}
+	if err := sm.storage.WriteLog(newLog); err != nil {
+		return fmt.Errorf("failed to write log: %v", err)
+	}
+	log.Debug("Log written: index - %d, term - %d, bytes - %d.", newLog.GetIndex(), newLog.GetTerm(), len(newLog.GetData()))
+	ch <- &konsen.AppendDataResp{Success: true}
+	return nil
 }
 
 func (sm *StateMachine) Close() error {
