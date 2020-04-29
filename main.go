@@ -2,17 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/chzyer/readline"
 	"github.com/lizhaoliu/konsen/v2/core"
 	"github.com/lizhaoliu/konsen/v2/net"
+	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
@@ -90,6 +95,8 @@ func createClients(cluster *core.ClusterConfig) (map[string]core.RaftService, er
 }
 
 func main() {
+	ctx := context.Background()
+
 	cluster, err := parseClusterConfig(clusterConfigPath)
 	if err != nil {
 		logrus.Fatalf("%v", err)
@@ -124,7 +131,7 @@ func main() {
 		}
 	}()
 	go func() {
-		sm.Run(context.Background())
+		sm.Run(ctx)
 	}()
 
 	if pprofPort > 0 {
@@ -137,10 +144,55 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
-	sig := <-sigCh
-	logrus.Infof("Syscall: %v", sig)
+	go func() {
+		sig := <-sigCh
+		logrus.Infof("Syscall: %v", sig)
 
-	sm.Close()
-	server.Stop()
-	storage.Close()
+		sm.Close()
+		server.Stop()
+		storage.Close()
+	}()
+
+	l, err := readline.New("\033[31m»\033[0m ")
+	if err != nil {
+		logrus.Fatalf("%v", err)
+	}
+	defer l.Close()
+
+	logrus.SetOutput(l.Stderr())
+	for {
+		line, err := l.Readline()
+		if err == readline.ErrInterrupt {
+			if len(line) == 0 {
+				break
+			} else {
+				continue
+			}
+		} else if err == io.EOF {
+			break
+		}
+
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "add "):
+			data := line[4:]
+			_, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: []byte(data)})
+			if err != nil {
+				logrus.Errorf("%v", err)
+			} else {
+				logrus.Infof("Successfully appended %q", data)
+			}
+		case line == "snapshot":
+			s, err := sm.GetSnapshot(ctx)
+			if err != nil {
+				logrus.Errorf("%v", err)
+			} else {
+				buf, err := json.MarshalIndent(s, "", "  ")
+				if err != nil {
+					logrus.Errorf("%v", err)
+				}
+				logrus.Infof("\n%s", buf)
+			}
+		}
+	}
 }

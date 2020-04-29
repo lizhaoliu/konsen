@@ -348,6 +348,7 @@ func (sm *StateMachine) handleAppendEntriesResp(
 		}
 	} else {
 		// AppendEntries fails because of log inconsistency: decrement nextIndex and retry.
+		log.Infof("sm.nextIndex[%q](%d)--", endpoint, sm.nextIndex[endpoint])
 		sm.nextIndex[endpoint]--
 	}
 
@@ -480,12 +481,17 @@ func (sm *StateMachine) becomeLeader(term uint64) error {
 	if err != nil {
 		return err
 	}
-	for c := range sm.nextIndex {
-		sm.nextIndex[c] = lastLogIndex + 1
+
+	log.Infof("lastLogIndex: %d", lastLogIndex)
+	// Resets nextIndex and matchIndex after election.
+	for _, endpoint := range sm.cluster.Endpoints {
+		if endpoint != sm.cluster.LocalEndpoint {
+			sm.nextIndex[endpoint] = lastLogIndex + 1
+			sm.matchIndex[endpoint] = 0
+		}
 	}
-	for c := range sm.matchIndex {
-		sm.matchIndex[c] = 0
-	}
+	log.Infof("nextIndex: %v", sm.nextIndex)
+	log.Infof("matchIndex: %v", sm.matchIndex)
 
 	sm.startHeartbeatLoop(context.Background())
 
@@ -564,6 +570,7 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 				resp, err := sm.clients[endpoint].AppendEntries(ctx, req)
 				if err != nil {
 					log.Debug("Failed to send AppendEntries to %q: %v", endpoint, err)
+					return
 				}
 				select {
 				case sm.msgCh <- appendEntriesRespWrap{
@@ -799,6 +806,8 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 			resp, err := sm.clients[sm.currentLeader].AppendData(ctx, req)
 			if err != nil {
 				log.Debug("Failed to send AppendDataReq to leader %q: %v", sm.currentLeader, err)
+				ch <- &konsen.AppendDataResp{Success: false}
+				return
 			}
 			ch <- resp
 		}()
