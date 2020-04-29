@@ -142,11 +142,7 @@ func (sm *StateMachine) Run(ctx context.Context) {
 // AppendEntries puts the incoming AppendEntries request in main message channel and waits for result.
 func (sm *StateMachine) AppendEntries(ctx context.Context, req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
 	ch := make(chan *konsen.AppendEntriesResp)
-	wrap := appendEntriesWrap{
-		req: req,
-		ch:  ch,
-	}
-	sm.msgCh <- wrap
+	sm.msgCh <- appendEntriesWrap{req: req, ch: ch}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -158,11 +154,7 @@ func (sm *StateMachine) AppendEntries(ctx context.Context, req *konsen.AppendEnt
 // RequestVote puts the incoming RequestVote request in main message channel and waits for result.
 func (sm *StateMachine) RequestVote(ctx context.Context, req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
 	ch := make(chan *konsen.RequestVoteResp)
-	wrap := requestVoteWrap{
-		req: req,
-		ch:  ch,
-	}
-	sm.msgCh <- wrap
+	sm.msgCh <- requestVoteWrap{req: req, ch: ch}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -171,16 +163,12 @@ func (sm *StateMachine) RequestVote(ctx context.Context, req *konsen.RequestVote
 	}
 }
 
-func (sm *StateMachine) grantVote(term uint64, candidateID string, ch chan<- *konsen.RequestVoteResp) error {
+func (sm *StateMachine) grantVote(term uint64, candidateID string) (*konsen.RequestVoteResp, error) {
 	if err := sm.storage.SetVotedFor(candidateID); err != nil {
-		return err
-	}
-	ch <- &konsen.RequestVoteResp{
-		Term:        term,
-		VoteGranted: true,
+		return nil, err
 	}
 	log.Debug("Granted vote for candidate %q for term %d", candidateID, term)
-	return nil
+	return &konsen.RequestVoteResp{Term: term, VoteGranted: true}, nil
 }
 
 // maybeBecomeFollower checks if the given term is greater than current term, if true then update current term to
@@ -212,23 +200,19 @@ func (sm *StateMachine) openElectionTimerGate() {
 	sm.timerGateCh <- struct{}{}
 }
 
-func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch chan<- *konsen.AppendEntriesResp) error {
+func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
 	sm.resetElectionTimer()
 	defer sm.openElectionTimerGate()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(req.GetTerm())
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// 1. Reply false if term < currentTerm.
 	if req.GetTerm() < currentTerm {
-		ch <- &konsen.AppendEntriesResp{
-			Term:    currentTerm,
-			Success: false,
-		}
-		return nil
+		return &konsen.AppendEntriesResp{Term: currentTerm, Success: false}, nil
 	}
 
 	// At this point, the request is coming from a legit leader, and request term == currentTerm.
@@ -237,15 +221,11 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
 	prevLogTerm, err := sm.storage.GetLogTerm(req.GetPrevLogIndex())
 	if err != nil {
-		return fmt.Errorf("failed to get log at index %d: %v", req.GetPrevLogIndex(), err)
+		return nil, fmt.Errorf("failed to get log at index %d: %v", req.GetPrevLogIndex(), err)
 	}
 	if prevLogTerm != req.GetPrevLogTerm() {
 		log.Infof("Local prevLogTerm(%d) mismatches request prevLogTerm(%d).", prevLogTerm, req.GetPrevLogTerm())
-		ch <- &konsen.AppendEntriesResp{
-			Term:    currentTerm,
-			Success: false,
-		}
-		return nil
+		return &konsen.AppendEntriesResp{Term: currentTerm, Success: false}, nil
 	}
 
 	entries := req.GetEntries()
@@ -256,7 +236,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 		for i, newLog := range entries {
 			localLog, err := sm.storage.GetLog(newLog.GetIndex())
 			if err != nil {
-				return fmt.Errorf("failed to get log at index %d: %v", newLog.GetIndex(), err)
+				return nil, fmt.Errorf("failed to get log at index %d: %v", newLog.GetIndex(), err)
 			}
 			if localLog == nil {
 				startIdx = i
@@ -265,7 +245,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 			if localLog.GetTerm() != newLog.GetTerm() {
 				log.Infof("Local logs conflict from index %d, now delete onwards.", newLog.GetIndex())
 				if err := sm.storage.DeleteLogsFrom(newLog.GetIndex()); err != nil {
-					return fmt.Errorf("failed to delete logs from min index %d: %v", newLog.GetIndex(), err)
+					return nil, fmt.Errorf("failed to delete logs from min index %d: %v", newLog.GetIndex(), err)
 				}
 				startIdx = i
 				break
@@ -275,7 +255,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 		// 4. Append any new entries not already in the log.
 		log.Infof("Append logs from index %d.", entries[startIdx].GetIndex())
 		if err := sm.storage.WriteLogs(entries[startIdx:]); err != nil {
-			return fmt.Errorf("failed to write logs: %v", err)
+			return nil, fmt.Errorf("failed to write logs: %v", err)
 		}
 	}
 
@@ -283,7 +263,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 	if req.GetLeaderCommit() > sm.commitIndex {
 		lastLogIndex, err := sm.storage.LastLogIndex()
 		if err != nil {
-			return fmt.Errorf("failed to get index of the last log: %v", err)
+			return nil, fmt.Errorf("failed to get index of the last log: %v", err)
 		}
 		sm.commitIndex = req.GetLeaderCommit()
 		if lastLogIndex < sm.commitIndex {
@@ -293,12 +273,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 	}
 
 	// Reply with success.
-	ch <- &konsen.AppendEntriesResp{
-		Term:    currentTerm,
-		Success: true,
-	}
-
-	return nil
+	return &konsen.AppendEntriesResp{Term: currentTerm, Success: true}, nil
 }
 
 func (sm *StateMachine) handleAppendEntriesResp(
@@ -365,23 +340,19 @@ func (sm *StateMachine) isLogOnMajority(logIndex uint64) bool {
 	return n > len(sm.cluster.Endpoints)/2
 }
 
-func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- *konsen.RequestVoteResp) error {
+func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
 	sm.resetElectionTimer()
 	defer sm.openElectionTimerGate()
 
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(req.GetTerm())
 	if err != nil {
-		return fmt.Errorf("%v", err)
+		return nil, fmt.Errorf("%v", err)
 	}
 
 	// 1. Reply false if term < currentTerm.
 	if req.GetTerm() < currentTerm {
-		ch <- &konsen.RequestVoteResp{
-			Term:        currentTerm,
-			VoteGranted: false,
-		}
-		return nil
+		return &konsen.RequestVoteResp{Term: currentTerm, VoteGranted: false}, nil
 	}
 
 	// Now candidate's term == currentTerm.
@@ -389,16 +360,12 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- 
 	// 2. If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote.
 	votedFor, err := sm.storage.GetVotedFor()
 	if err != nil {
-		return fmt.Errorf("failed to get votedFor: %v", err)
+		return nil, fmt.Errorf("failed to get votedFor: %v", err)
 	}
 
 	// If already voted for another candidate, deny the vote.
 	if votedFor != "" && votedFor != req.GetCandidateId() {
-		ch <- &konsen.RequestVoteResp{
-			Term:        currentTerm,
-			VoteGranted: false,
-		}
-		return nil
+		return &konsen.RequestVoteResp{Term: currentTerm, VoteGranted: false}, nil
 	}
 
 	// If candidate’s log is at least as up-to-date as receiver’s log, grant vote.
@@ -406,44 +373,29 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq, ch chan<- 
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
 	lastLogTerm, err := sm.storage.LastLogTerm()
 	if err != nil {
-		return fmt.Errorf("failed to get last log's term: %v", err)
+		return nil, fmt.Errorf("failed to get last log's term: %v", err)
 	}
 	// Candidate's last log term is older, deny the vote.
 	if req.GetLastLogTerm() < lastLogTerm {
-		ch <- &konsen.RequestVoteResp{
-			Term:        currentTerm,
-			VoteGranted: false,
-		}
-		return nil
+		return &konsen.RequestVoteResp{Term: currentTerm, VoteGranted: false}, nil
 	}
 
 	// Candidate's last log term is newer, grant vote.
 	if req.GetLastLogTerm() > lastLogTerm {
-		if err := sm.grantVote(currentTerm, req.GetCandidateId(), ch); err != nil {
-			return fmt.Errorf("failed to grant vote: %v", err)
-		}
-		return nil
+		return sm.grantVote(currentTerm, req.GetCandidateId())
 	}
 
 	// If last logs have the same term, then whichever log is longer is more up-to-date.
 	lastLogIndex, err := sm.storage.LastLogIndex()
 	if err != nil {
-		return fmt.Errorf("failed to get last log's index: %v", err)
+		return nil, fmt.Errorf("failed to get last log's index: %v", err)
 	}
 	if req.GetLastLogIndex() >= lastLogIndex {
-		if err := sm.grantVote(currentTerm, req.GetCandidateId(), ch); err != nil {
-			return fmt.Errorf("failed to grant vote: %v", err)
-		}
-		return nil
+		return sm.grantVote(currentTerm, req.GetCandidateId())
 	}
 
 	// The candidate's log is not as up-to-date as receiver's, deny the vote.
-	ch <- &konsen.RequestVoteResp{
-		Term:        currentTerm,
-		VoteGranted: false,
-	}
-
-	return nil
+	return &konsen.RequestVoteResp{Term: currentTerm, VoteGranted: false}, nil
 }
 
 func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) error {
@@ -677,14 +629,18 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 				switch v := msg.(type) {
 				case appendEntriesWrap:
 					// Process incoming AppendEntries request.
-					if err := sm.handleAppendEntries(v.req, v.ch); err != nil {
+					resp, err := sm.handleAppendEntries(v.req)
+					if err != nil {
 						log.Fatalf("%v", err)
 					}
+					v.ch <- resp
 				case requestVoteWrap:
 					// Process incoming RequestVote request.
-					if err := sm.handleRequestVote(v.req, v.ch); err != nil {
+					resp, err := sm.handleRequestVote(v.req)
+					if err != nil {
 						log.Fatalf("%v", err)
 					}
+					v.ch <- resp
 				case appendEntriesRespWrap:
 					if err := sm.handleAppendEntriesResp(v.resp, v.req, v.endpoint); err != nil {
 						log.Fatalf("%v", err)
@@ -706,9 +662,11 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 						log.Fatalf("%v", err)
 					}
 				case getSnapshotMsg:
-					if err := sm.handleGetSnapshot(v.ch); err != nil {
+					snapshot, err := sm.handleGetSnapshot()
+					if err != nil {
 						log.Fatalf("%v", err)
 					}
+					v.ch <- snapshot
 				default:
 					log.Fatalf("Unrecognized message: %v", v)
 				}
@@ -780,16 +738,13 @@ func (sm *StateMachine) nextTimeout() time.Duration {
 
 func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
 	ch := make(chan *konsen.AppendDataResp)
-	sm.msgCh <- appendDataMsg{
-		req: req,
-		ch:  ch,
-	}
+	sm.msgCh <- appendDataMsg{req: req, ch: ch}
 
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-sm.stopCh:
-		return nil, fmt.Errorf("server has been stopped during the request")
+		return nil, fmt.Errorf("server has been shut down")
 	case resp := <-ch:
 		return resp, nil
 	}
@@ -797,6 +752,8 @@ func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataRe
 
 // handleAppendData processes a appendDataMsg, it writes the data into local (or on leader's) logs, but does NOT wait
 // for quorum replication.
+// The message loop goroutine should NEVER block in this method since it depends on subsequent AppendEntriesResp in
+// order to determine which log is committed, otherwise it will deadlock.
 func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) error {
 	// Only leader writes data to its logs.
 	if sm.role != konsen.Role_LEADER {
@@ -856,15 +813,14 @@ func (sm *StateMachine) GetSnapshot(ctx context.Context) (*Snapshot, error) {
 	}
 }
 
-func (sm *StateMachine) handleGetSnapshot(ch chan<- *Snapshot) error {
+func (sm *StateMachine) handleGetSnapshot() (*Snapshot, error) {
 	currentTerm, err := sm.storage.GetCurrentTerm()
 	if err != nil {
-		return fmt.Errorf("failed to get current term: %v", err)
+		return nil, fmt.Errorf("failed to get current term: %v", err)
 	}
-	// TODO: in the future we don't need to get all logs, just for debug now.
 	logs, err := sm.storage.GetLogsFrom(1)
 	if err != nil {
-		return fmt.Errorf("failed to get logs: %v", err)
+		return nil, fmt.Errorf("failed to get logs: %v", err)
 	}
 	nextIndexMap := make(map[string]uint64)
 	for k, v := range sm.nextIndex {
@@ -882,7 +838,7 @@ func (sm *StateMachine) handleGetSnapshot(ch chan<- *Snapshot) error {
 		logTerms[i] = e.GetTerm()
 		logSizes[i] = len(e.GetData())
 	}
-	ch <- &Snapshot{
+	return &Snapshot{
 		CurrentTerm:   currentTerm,
 		CommitIndex:   sm.commitIndex,
 		LastApplied:   sm.lastApplied,
@@ -893,8 +849,7 @@ func (sm *StateMachine) handleGetSnapshot(ch chan<- *Snapshot) error {
 		LogIndices:    logIndices,
 		LogTerms:      logTerms,
 		LogSizes:      logSizes,
-	}
-	return nil
+	}, nil
 }
 
 func (sm *StateMachine) Close() error {
