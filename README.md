@@ -1,7 +1,7 @@
 # konsen
 ### Introduction
 konsen is an implementation of [Raft](https://raft.github.io/raft.pdf) consensus algorithm, that aims to be 
-highly scalable, fast and minimal of size.  
+highly scalable, fast and minimal of size. For a cluster of N nodes, it can tolerate up to N/2 failures. 
 ### Features
 - [x] Consensus with replicated state machine.
 - [x] Distributed leader election.

@@ -227,7 +227,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 		return nil
 	}
 
-	// At this point, the request is coming from a legit leader.
+	// At this point, the request is coming from a legit leader, and request term == currentTerm.
 	sm.currentLeader = req.GetLeaderId()
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
@@ -277,11 +277,11 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq, ch cha
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
 	if req.GetLeaderCommit() > sm.commitIndex {
-		sm.commitIndex = req.GetLeaderCommit()
 		lastLogIndex, err := sm.storage.LastLogIndex()
 		if err != nil {
 			return fmt.Errorf("failed to get index of the last log: %v", err)
 		}
+		sm.commitIndex = req.GetLeaderCommit()
 		if lastLogIndex < sm.commitIndex {
 			sm.commitIndex = lastLogIndex
 		}
@@ -337,6 +337,8 @@ func (sm *StateMachine) handleAppendEntriesResp(
 			}
 			if logIndex > sm.commitIndex && sm.isLogOnMajority(logIndex) && logTerm == currentTerm {
 				sm.commitIndex = logIndex
+				// TODO: notify the commitIndex change, since some logs are replicated on quorum.
+
 				break
 			}
 		}
