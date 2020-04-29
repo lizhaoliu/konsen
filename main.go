@@ -119,7 +119,9 @@ func main() {
 		StateMachine: sm,
 	})
 	go func() {
-		server.Serve()
+		if err := server.Serve(); err != nil {
+			logrus.Fatalf("%v", err)
+		}
 	}()
 	go func() {
 		sm.Run(context.Background())

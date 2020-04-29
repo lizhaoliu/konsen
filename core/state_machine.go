@@ -45,6 +45,9 @@ type StateMachine struct {
 	clients map[string]RaftService
 
 	wg sync.WaitGroup
+
+	mut  sync.Mutex
+	cond *sync.Cond
 }
 
 // StateMachineConfig
@@ -124,6 +127,7 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 		nextIndex:  make(map[string]uint64),
 		matchIndex: make(map[string]uint64),
 	}
+	sm.cond = sync.NewCond(&sm.mut)
 
 	return sm, nil
 }
@@ -337,8 +341,8 @@ func (sm *StateMachine) handleAppendEntriesResp(
 			}
 			if logIndex > sm.commitIndex && sm.isLogOnMajority(logIndex) && logTerm == currentTerm {
 				sm.commitIndex = logIndex
-				// TODO: notify the commitIndex change, since some logs are replicated on quorum.
-
+				// Notify the commitIndex change: some logs are replicated on quorum.
+				sm.cond.Broadcast()
 				break
 			}
 		}
@@ -784,7 +788,8 @@ func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataRe
 	}
 }
 
-// handleAppendData processes a appendDataMsg.
+// handleAppendData processes a appendDataMsg, it writes the data into local (or on leader's) logs, but does NOT wait
+// for quorum replication.
 func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) error {
 	// Only leader writes data to its logs.
 	if sm.role != konsen.Role_LEADER {
@@ -817,7 +822,17 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 		return fmt.Errorf("failed to write log: %v", err)
 	}
 	log.Debug("Log written: index - %d, term - %d, bytes - %d.", newLog.GetIndex(), newLog.GetTerm(), len(newLog.GetData()))
-	ch <- &konsen.AppendDataResp{Success: true}
+
+	// Waits until the new log is committed (replicated on quorum).
+	go func() {
+		sm.cond.L.Lock()
+		for sm.commitIndex < newLog.GetIndex() {
+			sm.cond.Wait()
+		}
+		log.Infof("Log(%d) is on quorum.", newLog.GetIndex())
+		ch <- &konsen.AppendDataResp{Success: true}
+		sm.cond.L.Unlock()
+	}()
 	return nil
 }
 
