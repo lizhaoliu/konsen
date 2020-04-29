@@ -232,7 +232,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 		return nil, fmt.Errorf("failed to get log at index %d: %v", req.GetPrevLogIndex(), err)
 	}
 	if prevLogTerm != req.GetPrevLogTerm() {
-		log.Infof("Local prevLogTerm(%d) mismatches request prevLogTerm(%d).", prevLogTerm, req.GetPrevLogTerm())
+		log.Debug("Local prevLogTerm(%d) mismatches request prevLogTerm(%d).", prevLogTerm, req.GetPrevLogTerm())
 		return &konsen.AppendEntriesResp{Term: currentTerm, Success: false}, nil
 	}
 
@@ -251,7 +251,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 				break
 			}
 			if localLog.GetTerm() != newLog.GetTerm() {
-				log.Infof("Local logs conflict from index %d, now delete onwards.", newLog.GetIndex())
+				log.Debug("Local logs conflict from index %d, now delete onwards.", newLog.GetIndex())
 				if err := sm.storage.DeleteLogsFrom(newLog.GetIndex()); err != nil {
 					return nil, fmt.Errorf("failed to delete logs from min index %d: %v", newLog.GetIndex(), err)
 				}
