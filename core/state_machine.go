@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,8 @@ type electionTimeoutMsg struct{}
 // appendEntriesMsg represents a message to send AppendEntries request to all nodes.
 type appendEntriesMsg struct{}
 
+//////////////
+
 // appendDataMsg represents a message to append given data into state machine.
 type appendDataMsg struct {
 	req *konsen.AppendDataReq
@@ -102,6 +105,11 @@ type appendDataMsg struct {
 // getSnapshotMsg represents a message to generate a state snapshot.
 type getSnapshotMsg struct {
 	ch chan<- *Snapshot
+}
+
+type getValueMsg struct {
+	key []byte
+	ch  chan<- []byte
 }
 
 // NewStateMachine
@@ -253,7 +261,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 		}
 
 		// 4. Append any new entries not already in the log.
-		log.Infof("Append logs from index %d.", entries[startIdx].GetIndex())
+		log.Debug("Append logs from index %d.", entries[startIdx].GetIndex())
 		if err := sm.storage.WriteLogs(entries[startIdx:]); err != nil {
 			return nil, fmt.Errorf("failed to write logs: %v", err)
 		}
@@ -269,7 +277,6 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 		if lastLogIndex < sm.commitIndex {
 			sm.commitIndex = lastLogIndex
 		}
-		log.Infof("leaderCommit > commitIndex, commitIndex(%d) = min(leaderCommit(%d), last log entry(%d)).", sm.commitIndex, req.GetLeaderCommit(), lastLogIndex)
 	}
 
 	// Reply with success.
@@ -323,7 +330,6 @@ func (sm *StateMachine) handleAppendEntriesResp(
 		}
 	} else {
 		// AppendEntries fails because of log inconsistency: decrement nextIndex and retry.
-		log.Infof("sm.nextIndex[%q](%d)--", endpoint, sm.nextIndex[endpoint])
 		sm.nextIndex[endpoint]--
 	}
 
@@ -434,7 +440,6 @@ func (sm *StateMachine) becomeLeader(term uint64) error {
 		return err
 	}
 
-	log.Infof("lastLogIndex: %d", lastLogIndex)
 	// Resets nextIndex and matchIndex after election.
 	for _, endpoint := range sm.cluster.Endpoints {
 		if endpoint != sm.cluster.LocalEndpoint {
@@ -442,8 +447,6 @@ func (sm *StateMachine) becomeLeader(term uint64) error {
 			sm.matchIndex[endpoint] = 0
 		}
 	}
-	log.Infof("nextIndex: %v", sm.nextIndex)
-	log.Infof("matchIndex: %v", sm.matchIndex)
 
 	sm.startHeartbeatLoop(context.Background())
 
@@ -595,7 +598,7 @@ func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) 
 		if err := applyCommand(logEntry.GetData()); err != nil {
 			return fmt.Errorf("failed to apply command from log at index %d", sm.lastApplied)
 		}
-		log.Infof("Applied log at index %d", sm.lastApplied)
+		log.Debug("Applied log at index %d", sm.lastApplied)
 	}
 	return nil
 }
@@ -609,9 +612,13 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 		for {
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
 			if err := sm.maybeApplyLogs(func(command []byte) error {
-				// TODO: this is a placeholder, make the function configurable by user.
-				log.Infof("Apply: %s", command)
-				return nil
+				// TODO: make this function configurable by users.
+				cmdStr := string(command)
+				kv := strings.Split(cmdStr, "=")
+				if len(kv) != 2 {
+					return fmt.Errorf("malformed kv pair, should be 'key=value'")
+				}
+				return sm.storage.SetValue([]byte(kv[0]), []byte(kv[1]))
 			}); err != nil {
 				log.Fatalf("%v", err)
 			}
@@ -667,6 +674,12 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 						log.Fatalf("%v", err)
 					}
 					v.ch <- snapshot
+				case getValueMsg:
+					val, err := sm.handleGetValue(v.key)
+					if err != nil {
+						log.Fatalf("%v", err)
+					}
+					v.ch <- val
 				default:
 					log.Fatalf("Unrecognized message: %v", v)
 				}
@@ -795,7 +808,7 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 		for sm.commitIndex < newLog.GetIndex() {
 			sm.cond.Wait()
 		}
-		log.Infof("Log(%d) is on quorum.", newLog.GetIndex())
+		log.Debug("Log(%d) is on quorum.", newLog.GetIndex())
 		ch <- &konsen.AppendDataResp{Success: true}
 		sm.cond.L.Unlock()
 	}()
@@ -850,6 +863,21 @@ func (sm *StateMachine) handleGetSnapshot() (*Snapshot, error) {
 		LogTerms:      logTerms,
 		LogSizes:      logSizes,
 	}, nil
+}
+
+func (sm *StateMachine) GetValue(ctx context.Context, key []byte) ([]byte, error) {
+	ch := make(chan []byte)
+	sm.msgCh <- getValueMsg{key: key, ch: ch}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		return resp, nil
+	}
+}
+
+func (sm *StateMachine) handleGetValue(key []byte) ([]byte, error) {
+	return sm.storage.GetValue(key)
 }
 
 func (sm *StateMachine) Close() error {

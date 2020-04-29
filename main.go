@@ -174,14 +174,19 @@ func main() {
 
 		line = strings.TrimSpace(line)
 		switch {
-		case strings.HasPrefix(line, "add "):
+		case strings.HasPrefix(line, "set "):
 			data := line[4:]
 			_, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: []byte(data)})
 			if err != nil {
 				logrus.Errorf("%v", err)
-			} else {
-				logrus.Infof("Successfully appended %q", data)
 			}
+		case strings.HasPrefix(line, "get "):
+			key := line[4:]
+			val, err := sm.GetValue(ctx, []byte(key))
+			if err != nil {
+				logrus.Errorf("%v", err)
+			}
+			logrus.Infof("%s", val)
 		case line == "snapshot":
 			s, err := sm.GetSnapshot(ctx)
 			if err != nil {
