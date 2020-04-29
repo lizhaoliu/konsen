@@ -5,7 +5,7 @@ highly scalable, fast and minimal of size. For a cluster of N nodes, it can tole
 ### Features
 - [x] Consensus with replicated state machine.
 - [x] Distributed leader election.
-- [ ] Distributed key-value storage.
+- [x] Distributed key-value storage.
 - [ ] Distributed transactions.
 ### Build
 #### Cluster configuration
