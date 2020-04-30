@@ -67,9 +67,8 @@ INFO[2020-04-29T21:54:58-07:00] Start konsen server on: "192.168.86.25:10004"
 INFO[2020-04-29T21:55:43-07:00] Lizhao Liu 
 ```
 ### TODO
-- [ ] HTTP server.
+- [ ] Unit tests.
 - [ ] Log compaction.
 - [ ] Cluster resize.
-- [ ] Tests, more tests.
+- [ ] HTTP server.
 - [ ] CI/CD pipeline.
-- [ ] Easy automatic deployment.
