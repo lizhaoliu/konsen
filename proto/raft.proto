@@ -48,6 +48,7 @@ message AppendDataReq {
 
 message AppendDataResp {
   bool success = 1;
+  string error_message = 2;
 }
 
 service Raft {

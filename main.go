@@ -176,9 +176,12 @@ func main() {
 		switch {
 		case strings.HasPrefix(line, "set "):
 			data := line[4:]
-			_, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: []byte(data)})
+			resp, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: []byte(data)})
 			if err != nil {
 				logrus.Errorf("%v", err)
+			}
+			if !resp.GetSuccess() {
+				logrus.Errorf("%v (is more than %d nodes down?)", resp.GetErrorMessage(), len(cluster.Endpoints)/2)
 			}
 		case strings.HasPrefix(line, "get "):
 			key := line[4:]

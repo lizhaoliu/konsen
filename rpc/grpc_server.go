@@ -3,12 +3,15 @@ package rpc
 import (
 	"context"
 	"net"
+	"time"
 
 	"github.com/lizhaoliu/konsen/v2/core"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
+
+const rpcTimeout = 10 * time.Second
 
 type RaftGRPCServer struct {
 	endpoint string
@@ -30,14 +33,23 @@ func NewRaftGRPCServer(config RaftGRPCServerConfig) *RaftGRPCServer {
 }
 
 func (r *RaftGRPCServer) AppendEntries(ctx context.Context, req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
+	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
 	return r.sm.AppendEntries(ctx, req)
 }
 
 func (r *RaftGRPCServer) RequestVote(ctx context.Context, req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
+	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
 	return r.sm.RequestVote(ctx, req)
 }
 
 func (r *RaftGRPCServer) AppendData(ctx context.Context, req *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
+	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
 	return r.sm.AppendData(ctx, req)
 }
 

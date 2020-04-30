@@ -800,18 +800,7 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 	// Only leader writes data to its logs.
 	if sm.role != konsen.Role_LEADER {
 		// Forward the request to leader.
-		sm.wg.Add(1)
-		go func() {
-			defer sm.wg.Done()
-			ctx := context.Background()
-			resp, err := sm.clients[sm.currentLeader].AppendData(ctx, req)
-			if err != nil {
-				log.Debug("Failed to send AppendDataReq to leader %q: %v", sm.currentLeader, err)
-				ch <- &konsen.AppendDataResp{Success: false}
-				return
-			}
-			ch <- resp
-		}()
+		sm.forwardRequestToLeader(req, ch)
 		return nil
 	}
 
@@ -833,19 +822,41 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 	}
 	log.Debug("Log written: index - %d, term - %d, bytes - %d.", newLog.GetIndex(), newLog.GetTerm(), len(newLog.GetData()))
 
-	// Waits until the new log is committed (replicated on quorum).
+	// Starts a new goroutine to wait until the new log is committed (replicated on quorum) and applied to local state machine.
+	sm.replyWhenLogApplied(newLog.GetIndex(), ch)
+	return nil
+}
+
+// forwardRequestToLeader starts a new goroutine to send request to current leader, and the goroutine replies after receiving result from leader.
+func (sm *StateMachine) forwardRequestToLeader(req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) {
+	sm.wg.Add(1)
+	go func() {
+		defer sm.wg.Done()
+		ctx := context.Background()
+		resp, err := sm.clients[sm.currentLeader].AppendData(ctx, req)
+		if err != nil {
+			log.Debug("Failed to send AppendDataReq to leader %q: %v", sm.currentLeader, err)
+			ch <- &konsen.AppendDataResp{Success: false, ErrorMessage: err.Error()}
+			return
+		}
+		ch <- resp
+	}()
+}
+
+// replyWhenLogApplied starts a new goroutine to reply request after new log is applied to local state machine.
+func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.AppendDataResp) {
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
 		sm.cond.L.Lock()
-		for sm.lastApplied < newLog.GetIndex() {
+		for sm.lastApplied < logIndex {
+			// TODO: add timeout mechanism.
 			sm.cond.Wait()
 		}
-		log.Debug("Log(%d) is on quorum.", newLog.GetIndex())
-		ch <- &konsen.AppendDataResp{Success: true}
 		sm.cond.L.Unlock()
+		log.Debug("Log(%d) is committed and applied on local state machine.", logIndex)
+		ch <- &konsen.AppendDataResp{Success: true}
 	}()
-	return nil
 }
 
 func (sm *StateMachine) GetSnapshot(ctx context.Context) (*Snapshot, error) {
