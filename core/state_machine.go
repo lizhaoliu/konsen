@@ -19,11 +19,17 @@ const (
 )
 
 // StateMachine is the state machine that implements Raft algorithm: https://raft.github.io/raft.pdf.
+// The state machine maintains a message queue (mailbox) internally, all requests/responses to the state machine are
+// processed asynchronously (although the caller still observes a synchronized behavior): they are firstly put onto the
+// message queue, then the message worker (goroutine) in turns takes a message at a time and processes it, and passes
+// the result back to caller. The internal state is never directly accessed by goroutines other than the message worker.
+// Internal errors will always cause a crash on the server since otherwise the state machine may be left in an
+// inconsistent state.
 type StateMachine struct {
-	msgCh        chan interface{} // Message channel.
+	msgCh        chan interface{} // Main message queue.
 	stopCh       chan struct{}    // Signals to stop the state machine.
-	timerGateCh  chan struct{}    // Signals to run next round of election timeout.
-	resetTimerCh chan struct{}    // Signals to reset election timer, in case of receiving AppendEntries or RequestVote.
+	timerGateCh  chan struct{}    // Signals to run next round of election timeout countdown.
+	resetTimerCh chan struct{}    // Signals to reset election timer when AppendEntries or RequestVote requests/response are received.
 
 	// Persistent state storage on all servers.
 	storage Storage
@@ -47,6 +53,7 @@ type StateMachine struct {
 
 	wg sync.WaitGroup
 
+	// Guard the condition where a certain log is replicated on quorum.
 	mut  sync.Mutex
 	cond *sync.Cond
 }
@@ -59,6 +66,7 @@ type StateMachineConfig struct {
 }
 
 // Snapshot is a snapshot of the internal state of a state machine.
+// TODO: Reduce the fields or remove this, as this is for debug purpose.
 type Snapshot struct {
 	CurrentTerm   uint64            // Current term.
 	CommitIndex   uint64            // Index of highest log entry known to be committed.
@@ -72,17 +80,20 @@ type Snapshot struct {
 	LogSizes      []int             // Log binary sizes.
 }
 
+// appendEntriesWrap
 type appendEntriesWrap struct {
 	req *konsen.AppendEntriesReq
 	ch  chan<- *konsen.AppendEntriesResp
 }
 
+// appendEntriesRespWrap
 type appendEntriesRespWrap struct {
 	resp     *konsen.AppendEntriesResp
 	req      *konsen.AppendEntriesReq
 	endpoint string
 }
 
+// requestVoteWrap
 type requestVoteWrap struct {
 	req *konsen.RequestVoteReq
 	ch  chan<- *konsen.RequestVoteResp
@@ -93,8 +104,6 @@ type electionTimeoutMsg struct{}
 
 // appendEntriesMsg represents a message to send AppendEntries request to all nodes.
 type appendEntriesMsg struct{}
-
-//////////////
 
 // appendDataMsg represents a message to append given data into state machine.
 type appendDataMsg struct {
@@ -107,12 +116,13 @@ type getSnapshotMsg struct {
 	ch chan<- *Snapshot
 }
 
+// getValueMsg represents a message to retrieve a value by given key.
 type getValueMsg struct {
 	key []byte
 	ch  chan<- []byte
 }
 
-// NewStateMachine
+// NewStateMachine creates a new instance of the state machine.
 func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 	if len(config.Cluster.Endpoints)%2 != 1 {
 		return nil, fmt.Errorf("number of nodes in the cluster must be an odd number, got: %d", len(config.Cluster.Endpoints))
@@ -171,6 +181,7 @@ func (sm *StateMachine) RequestVote(ctx context.Context, req *konsen.RequestVote
 	}
 }
 
+// grantVote creates a positive vote response for the candidate for given term.
 func (sm *StateMachine) grantVote(term uint64, candidateID string) (*konsen.RequestVoteResp, error) {
 	if err := sm.storage.SetVotedFor(candidateID); err != nil {
 		return nil, err
@@ -200,14 +211,17 @@ func (sm *StateMachine) maybeBecomeFollower(term uint64) (uint64, error) {
 	return currentTerm, nil
 }
 
+// resetElectionTimer signals the election timer to start a new round of election timeout countdown.
 func (sm *StateMachine) resetElectionTimer() {
 	sm.resetTimerCh <- struct{}{}
 }
 
+// openElectionTimerGate signals the election timer that it can start countdown.
 func (sm *StateMachine) openElectionTimerGate() {
 	sm.timerGateCh <- struct{}{}
 }
 
+// handleAppendEntries handles a AppendEntries request.
 func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
 	sm.resetElectionTimer()
 	defer sm.openElectionTimerGate()
@@ -283,6 +297,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 	return &konsen.AppendEntriesResp{Term: currentTerm, Success: true}, nil
 }
 
+// handleAppendEntriesResp handles a AppendEntries response.
 func (sm *StateMachine) handleAppendEntriesResp(
 	resp *konsen.AppendEntriesResp,
 	req *konsen.AppendEntriesReq,
@@ -336,6 +351,7 @@ func (sm *StateMachine) handleAppendEntriesResp(
 	return nil
 }
 
+// isLogOnMajority returns true if the log at given index is replicated on quorum.
 func (sm *StateMachine) isLogOnMajority(logIndex uint64) bool {
 	n := 1 // Already on this server.
 	for _, endpoint := range sm.cluster.Endpoints {
@@ -346,6 +362,7 @@ func (sm *StateMachine) isLogOnMajority(logIndex uint64) bool {
 	return n > len(sm.cluster.Endpoints)/2
 }
 
+// handleRequestVote handles a RequestVote request.
 func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
 	sm.resetElectionTimer()
 	defer sm.openElectionTimerGate()
@@ -404,6 +421,7 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq) (*konsen.R
 	return &konsen.RequestVoteResp{Term: currentTerm, VoteGranted: false}, nil
 }
 
+// handleRequestVoteResp handles a RequestVote response.
 func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) error {
 	sm.resetElectionTimer()
 	defer sm.openElectionTimerGate()
@@ -431,6 +449,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 	return nil
 }
 
+// becomeLeader modifies internal state to become a leader, and starts the worker that periodically sends heartbeat.
 func (sm *StateMachine) becomeLeader(term uint64) error {
 	log.Infof("Term - %d, leader - %q.", term, sm.cluster.LocalEndpoint)
 	sm.role = konsen.Role_LEADER
@@ -453,6 +472,7 @@ func (sm *StateMachine) becomeLeader(term uint64) error {
 	return nil
 }
 
+// sendVoteRequests constructs a RequestVote request and sends it to all nodes in the cluster.
 func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 	currentTerm, err := sm.storage.GetCurrentTerm()
 	if err != nil {
@@ -474,8 +494,10 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 	}
 	for _, endpoint := range sm.cluster.Endpoints {
 		if endpoint != sm.cluster.LocalEndpoint {
+			sm.wg.Add(1)
 			endpoint := endpoint
 			go func() {
+				defer sm.wg.Done()
 				resp, err := sm.clients[endpoint].RequestVote(ctx, req)
 				if err != nil {
 					log.Debug("Failed to send RequestVote to %q: %v", endpoint, err)
@@ -490,6 +512,7 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 	return nil
 }
 
+// sendAppendEntries constructs a AppendEntries request and sends it to all nodes in the cluster.
 func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 	if sm.role != konsen.Role_LEADER {
 		return nil
@@ -520,8 +543,10 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 				LeaderCommit: sm.commitIndex,
 			}
 
+			sm.wg.Add(1)
 			endpoint := endpoint
 			go func() {
+				defer sm.wg.Done()
 				resp, err := sm.clients[endpoint].AppendEntries(ctx, req)
 				if err != nil {
 					log.Debug("Failed to send AppendEntries to %q: %v", endpoint, err)
@@ -542,6 +567,7 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 	return nil
 }
 
+// handleElectionTimeout handles when the election timeout event triggers.
 func (sm *StateMachine) handleElectionTimeout() error {
 	// If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate.
 	sm.role = konsen.Role_CANDIDATE
@@ -587,6 +613,7 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	return nil
 }
 
+// maybeApplyLogs applies logs that are not yet.
 func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) error {
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
 	for sm.commitIndex > sm.lastApplied {
@@ -603,7 +630,8 @@ func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) 
 	return nil
 }
 
-// startMessageLoop starts the main message loop.
+// startMessageLoop starts the main message loop, the goroutine that runs message loop in turns picks an event from the
+// message channel and processes it.
 func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 	sm.wg.Add(1)
 	go func() {
@@ -733,7 +761,7 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
 			case <-sm.stopCh:
 				return
 			case <-ticker.C:
-				// TODO: potential data race, use a channel to signal role change.
+				// TODO: role is read by another goroutine, there might be data race.
 				if sm.role != konsen.Role_LEADER {
 					return
 				}
@@ -749,6 +777,7 @@ func (sm *StateMachine) nextTimeout() time.Duration {
 	return time.Duration(timeout)
 }
 
+// AppendData stores the given data into state machine, and it returns after the data is replicated onto quorum.
 func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
 	ch := make(chan *konsen.AppendDataResp)
 	sm.msgCh <- appendDataMsg{req: req, ch: ch}
@@ -771,7 +800,9 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 	// Only leader writes data to its logs.
 	if sm.role != konsen.Role_LEADER {
 		// Forward the request to leader.
+		sm.wg.Add(1)
 		go func() {
+			defer sm.wg.Done()
 			ctx := context.Background()
 			resp, err := sm.clients[sm.currentLeader].AppendData(ctx, req)
 			if err != nil {
@@ -803,7 +834,9 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 	log.Debug("Log written: index - %d, term - %d, bytes - %d.", newLog.GetIndex(), newLog.GetTerm(), len(newLog.GetData()))
 
 	// Waits until the new log is committed (replicated on quorum).
+	sm.wg.Add(1)
 	go func() {
+		defer sm.wg.Done()
 		sm.cond.L.Lock()
 		for sm.commitIndex < newLog.GetIndex() {
 			sm.cond.Wait()

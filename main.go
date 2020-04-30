@@ -16,8 +16,8 @@ import (
 
 	"github.com/chzyer/readline"
 	"github.com/lizhaoliu/konsen/v2/core"
-	"github.com/lizhaoliu/konsen/v2/net"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	"github.com/lizhaoliu/konsen/v2/rpc"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
@@ -82,7 +82,7 @@ func createClients(cluster *core.ClusterConfig) (map[string]core.RaftService, er
 	clients := make(map[string]core.RaftService)
 	for _, endpoint := range cluster.Endpoints {
 		if endpoint != cluster.LocalEndpoint {
-			c, err := net.NewRaftGRPCClient(net.RaftGRPCClientConfig{
+			c, err := rpc.NewRaftGRPCClient(rpc.RaftGRPCClientConfig{
 				Endpoint: endpoint,
 			})
 			if err != nil {
@@ -121,7 +121,7 @@ func main() {
 		logrus.Fatalf("Failed to create state machine: %v", err)
 	}
 
-	server := net.NewRaftGRPCServer(net.RaftGRPCServerConfig{
+	server := rpc.NewRaftGRPCServer(rpc.RaftGRPCServerConfig{
 		Endpoint:     cluster.LocalEndpoint,
 		StateMachine: sm,
 	})

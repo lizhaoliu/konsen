@@ -1,13 +1,14 @@
 # konsen
-### Introduction
-konsen is an implementation of [Raft](https://raft.github.io/raft.pdf) consensus algorithm, that aims to be 
-highly scalable, fast and minimal of size. For a cluster of N nodes, it can tolerate up to N/2 failures. 
+### Overview
+konsen is an implementation of [Raft](https://raft.github.io/raft.pdf) consensus protocol based upon replicated state
+machine. konson offers strong consistency and partition tolerance. For a cluster of N nodes, it can tolerate up to N/2
+failures.
 ### Features
 - [x] Consensus with replicated state machine.
-- [x] Distributed leader election.
-- [x] Distributed key-value storage.
+- [x] Leader election.
+- [x] Distributed key-value store.
 - [ ] Distributed transactions.
-### Build
+### Build Local Cluster
 #### Cluster configuration
 Edit the cluster config in `conf/cluster.yml`, for example: 
 ```yaml
@@ -40,8 +41,33 @@ output/
     bootstrap.sh
     cluster.yml
     konsen
+  ...
+```
+#### Run (key-value store example)
+Start a cluster of 5 nodes, and one becomes a leader
+```
+INFO[2020-04-29T21:54:57-07:00] Cluster endpoints: ["192.168.86.25:10001" "192.168.86.25:10002" "192.168.86.25:10003" "192.168.86.25:10004" "192.168.86.25:10005"] 
+INFO[2020-04-29T21:54:57-07:00] BoltDB storage file set to: ...
+INFO[2020-04-29T21:54:57-07:00] Start konsen server on: "192.168.86.25:10003" 
+INFO[2020-04-29T21:54:59-07:00] Term - 5, leader - "192.168.86.25:10003".
+```
+Set a key-value from a non-leader node
+```
+INFO[2020-04-29T21:54:59-07:00] Cluster endpoints: ["192.168.86.25:10001" "192.168.86.25:10002" "192.168.86.25:10003" "192.168.86.25:10004" "192.168.86.25:10005"] 
+INFO[2020-04-29T21:54:59-07:00] BoltDB storage file set to: ...
+INFO[2020-04-29T21:54:59-07:00] Start konsen server on: "192.168.86.25:10005" 
+» set name=Lizhao Liu
+```
+Get value by key from another node
+```
+INFO[2020-04-29T21:54:58-07:00] Cluster endpoints: ["192.168.86.25:10001" "192.168.86.25:10002" "192.168.86.25:10003" "192.168.86.25:10004" "192.168.86.25:10005"] 
+INFO[2020-04-29T21:54:58-07:00] BoltDB storage file set to: ...
+INFO[2020-04-29T21:54:58-07:00] Start konsen server on: "192.168.86.25:10004" 
+» get name
+INFO[2020-04-29T21:55:43-07:00] Lizhao Liu 
 ```
 ### TODO
+- [ ] HTTP server.
 - [ ] Log compaction.
 - [ ] Cluster resize.
 - [ ] Tests, more tests.

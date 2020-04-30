@@ -1,4 +1,4 @@
-package net
+package rpc
 
 import (
 	"context"
@@ -42,10 +42,10 @@ func (r *RaftGRPCServer) AppendData(ctx context.Context, req *konsen.AppendDataR
 }
 
 func (r *RaftGRPCServer) Serve() error {
-	logrus.Infof("Starting Raft server on: %q", r.endpoint)
+	logrus.Infof("Start konsen server on: %q", r.endpoint)
 	lis, err := net.Listen("tcp", r.endpoint)
 	if err != nil {
-		logrus.Fatalf("Failed to start Raft server: %v", err)
+		logrus.Fatalf("Failed to start server: %v", err)
 	}
 	server := grpc.NewServer()
 	konsen.RegisterRaftServer(server, r)

@@ -1,4 +1,4 @@
-package net
+package rpc
 
 import (
 	"context"
@@ -30,7 +30,7 @@ func NewRaftGRPCClient(config RaftGRPCClientConfig) (*RaftGRPCClient, error) {
 	conn, err := grpc.DialContext(
 		ctx,
 		config.Endpoint,
-		grpc.WithInsecure(),
+		grpc.WithInsecure(), // TODO: enable secured connection.
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{}),
 	)
 	if err != nil {
