@@ -338,8 +338,6 @@ func (sm *StateMachine) handleAppendEntriesResp(
 			}
 			if logIndex > sm.commitIndex && sm.isLogOnMajority(logIndex) && logTerm == currentTerm {
 				sm.commitIndex = logIndex
-				// Notify the commitIndex change: some logs are replicated on quorum.
-				sm.cond.Broadcast()
 				break
 			}
 		}
@@ -625,6 +623,8 @@ func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) 
 		if err := applyCommand(logEntry.GetData()); err != nil {
 			return fmt.Errorf("failed to apply command from log at index %d", sm.lastApplied)
 		}
+		// Notifies if there are goroutines that are waiting on logs being applied.
+		sm.cond.Broadcast()
 		log.Debug("Applied log at index %d", sm.lastApplied)
 	}
 	return nil
@@ -792,8 +792,8 @@ func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataRe
 	}
 }
 
-// handleAppendData processes a appendDataMsg, it writes the data into local (or on leader's) logs, but does NOT wait
-// for quorum replication.
+// handleAppendData processes a appendDataMsg, it writes the data into local (or on leader's) logs, returns after the
+// data is applied to local state machine.
 // The message loop goroutine should NEVER block in this method since it depends on subsequent AppendEntriesResp in
 // order to determine which log is committed, otherwise it will deadlock.
 func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) error {
@@ -838,7 +838,7 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 	go func() {
 		defer sm.wg.Done()
 		sm.cond.L.Lock()
-		for sm.commitIndex < newLog.GetIndex() {
+		for sm.lastApplied < newLog.GetIndex() {
 			sm.cond.Wait()
 		}
 		log.Debug("Log(%d) is on quorum.", newLog.GetIndex())
