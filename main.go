@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -20,7 +19,6 @@ import (
 	"github.com/lizhaoliu/konsen/v2/rpc"
 	"github.com/lizhaoliu/konsen/v2/store"
 	"github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -49,47 +47,17 @@ func init() {
 	logrus.SetLevel(logrus.InfoLevel)
 }
 
-func parseClusterConfig(configFilePath string) (*core.ClusterConfig, error) {
-	buf, err := ioutil.ReadFile(configFilePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read cluster config file: %v", err)
-	}
-	cluster := &core.ClusterConfig{}
-	if err := yaml.Unmarshal(buf, cluster); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal cluster config file: %v", err)
-	}
-
-	if cluster.LocalEndpoint == "" {
-		return nil, fmt.Errorf("local endpoint/address is unspecified")
-	}
-
-	numNodes := len(cluster.Endpoints)
-	if numNodes%2 != 1 {
-		return nil, fmt.Errorf("number of nodes in a cluster must be odd, got: %d", numNodes)
-	}
-
-	logrus.Infof("Cluster endpoints: %q", cluster.Endpoints)
-
-	for _, endpoint := range cluster.Endpoints {
-		if cluster.LocalEndpoint == endpoint {
-			return cluster, nil
-		}
-	}
-
-	return nil, fmt.Errorf("local server endpoint %q is not in cluster", cluster.LocalEndpoint)
-}
-
 func createClients(cluster *core.ClusterConfig) (map[string]core.RaftService, error) {
 	clients := make(map[string]core.RaftService)
-	for _, endpoint := range cluster.Endpoints {
-		if endpoint != cluster.LocalEndpoint {
+	for server, endpoint := range cluster.Servers {
+		if server != cluster.LocalServerName {
 			c, err := rpc.NewRaftGRPCClient(rpc.RaftGRPCClientConfig{
 				Endpoint: endpoint,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to create GRPC client: %v", err)
 			}
-			clients[endpoint] = c
+			clients[server] = c
 		}
 	}
 	return clients, nil
@@ -98,7 +66,7 @@ func createClients(cluster *core.ClusterConfig) (map[string]core.RaftService, er
 func main() {
 	ctx := context.Background()
 
-	cluster, err := parseClusterConfig(clusterConfigPath)
+	cluster, err := core.ParseClusterConfig(clusterConfigPath)
 	if err != nil {
 		logrus.Fatalf("%v", err)
 	}
@@ -123,7 +91,7 @@ func main() {
 	}
 
 	server := rpc.NewRaftGRPCServer(rpc.RaftGRPCServerConfig{
-		Endpoint:     cluster.LocalEndpoint,
+		Endpoint:     cluster.Servers[cluster.LocalServerName],
 		StateMachine: sm,
 	})
 	go func() {
@@ -144,7 +112,7 @@ func main() {
 	}
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigCh
 		logrus.Infof("Syscall: %v", sig)
@@ -182,7 +150,7 @@ func main() {
 				logrus.Errorf("%v", err)
 			}
 			if !resp.GetSuccess() {
-				logrus.Errorf("%v (is more than %d nodes down?)", resp.GetErrorMessage(), len(cluster.Endpoints)/2)
+				logrus.Errorf("%v (more than %d nodes down?)", resp.GetErrorMessage(), len(cluster.Servers)/2)
 			}
 		case strings.HasPrefix(line, "get "):
 			key := line[4:]

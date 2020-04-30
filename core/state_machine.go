@@ -63,7 +63,7 @@ type StateMachine struct {
 type StateMachineConfig struct {
 	Storage store.Storage          // Local storage instance.
 	Cluster *ClusterConfig         // Cluster configuration.
-	Clients map[string]RaftService // A map of {endpoint: client instance}.
+	Clients map[string]RaftService // A map of "server name": "Raft service".
 }
 
 // Snapshot is a snapshot of the internal state of a state machine.
@@ -89,9 +89,9 @@ type appendEntriesWrap struct {
 
 // appendEntriesRespWrap
 type appendEntriesRespWrap struct {
-	resp     *konsen.AppendEntriesResp
-	req      *konsen.AppendEntriesReq
-	endpoint string
+	resp   *konsen.AppendEntriesResp // AppendEntries response from remote server.
+	req    *konsen.AppendEntriesReq  // Original AppendEntries request sent to remote server.
+	server string                    // Remote server name that sends the AppendEntries response.
 }
 
 // requestVoteWrap
@@ -125,8 +125,8 @@ type getValueMsg struct {
 
 // NewStateMachine creates a new instance of the state machine.
 func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
-	if len(config.Cluster.Endpoints)%2 != 1 {
-		return nil, fmt.Errorf("number of nodes in the cluster must be an odd number, got: %d", len(config.Cluster.Endpoints))
+	if len(config.Cluster.Servers)%2 != 1 {
+		return nil, fmt.Errorf("number of nodes in the cluster must be an odd number, got: %d", len(config.Cluster.Servers))
 	}
 
 	sm := &StateMachine{
@@ -302,7 +302,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 func (sm *StateMachine) handleAppendEntriesResp(
 	resp *konsen.AppendEntriesResp,
 	req *konsen.AppendEntriesReq,
-	endpoint string) error {
+	server string) error {
 	sm.resetElectionTimer()
 	defer sm.openElectionTimerGate()
 
@@ -326,8 +326,8 @@ func (sm *StateMachine) handleAppendEntriesResp(
 		}
 
 		// Successful: update nextIndex and matchIndex for follower.
-		sm.nextIndex[endpoint] = req.GetPrevLogIndex() + uint64(numEntries) + 1
-		sm.matchIndex[endpoint] = req.GetPrevLogIndex() + uint64(numEntries)
+		sm.nextIndex[server] = req.GetPrevLogIndex() + uint64(numEntries) + 1
+		sm.matchIndex[server] = req.GetPrevLogIndex() + uint64(numEntries)
 
 		// If there exists N: N > commitIndex && a majority of matchIndex[i] ≥ N && log[N].term == currentTerm, then set commitIndex = N.
 		// Only need to find the highest index, as lower index logs will always match if a higher one matches.
@@ -344,7 +344,7 @@ func (sm *StateMachine) handleAppendEntriesResp(
 		}
 	} else {
 		// AppendEntries fails because of log inconsistency: decrement nextIndex and retry.
-		sm.nextIndex[endpoint]--
+		sm.nextIndex[server]--
 	}
 
 	return nil
@@ -353,12 +353,12 @@ func (sm *StateMachine) handleAppendEntriesResp(
 // isLogOnMajority returns true if the log at given index is replicated on quorum.
 func (sm *StateMachine) isLogOnMajority(logIndex uint64) bool {
 	n := 1 // Already on this server.
-	for _, endpoint := range sm.cluster.Endpoints {
-		if endpoint != sm.cluster.LocalEndpoint && sm.matchIndex[endpoint] >= logIndex {
+	for server := range sm.cluster.Servers {
+		if server != sm.cluster.LocalServerName && sm.matchIndex[server] >= logIndex {
 			n++
 		}
 	}
-	return n > len(sm.cluster.Endpoints)/2
+	return n > len(sm.cluster.Servers)/2
 }
 
 // handleRequestVote handles a RequestVote request.
@@ -438,7 +438,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 	if resp.GetVoteGranted() {
 		sm.numVotes++
 		// If votes received from majority of servers, become leader.
-		if sm.numVotes > len(sm.cluster.Endpoints)/2 {
+		if sm.numVotes > len(sm.cluster.Servers)/2 {
 			if err := sm.becomeLeader(currentTerm); err != nil {
 				return fmt.Errorf("failed to become leader: %v", err)
 			}
@@ -450,19 +450,19 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 
 // becomeLeader modifies internal state to become a leader, and starts the worker that periodically sends heartbeat.
 func (sm *StateMachine) becomeLeader(term uint64) error {
-	log.Infof("Term - %d, leader - %q.", term, sm.cluster.LocalEndpoint)
+	log.Infof("Term - %d, leader - %q.", term, sm.cluster.LocalServerName)
 	sm.role = konsen.Role_LEADER
-	sm.currentLeader = sm.cluster.LocalEndpoint
+	sm.currentLeader = sm.cluster.LocalServerName
 	lastLogIndex, err := sm.storage.LastLogIndex()
 	if err != nil {
 		return err
 	}
 
 	// Resets nextIndex and matchIndex after election.
-	for _, endpoint := range sm.cluster.Endpoints {
-		if endpoint != sm.cluster.LocalEndpoint {
-			sm.nextIndex[endpoint] = lastLogIndex + 1
-			sm.matchIndex[endpoint] = 0
+	for server := range sm.cluster.Servers {
+		if server != sm.cluster.LocalServerName {
+			sm.nextIndex[server] = lastLogIndex + 1
+			sm.matchIndex[server] = 0
 		}
 	}
 
@@ -487,19 +487,19 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 	}
 	req := &konsen.RequestVoteReq{
 		Term:         currentTerm,
-		CandidateId:  sm.cluster.LocalEndpoint,
+		CandidateId:  sm.cluster.LocalServerName,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
-	for _, endpoint := range sm.cluster.Endpoints {
-		if endpoint != sm.cluster.LocalEndpoint {
+	for server := range sm.cluster.Servers {
+		if server != sm.cluster.LocalServerName {
 			sm.wg.Add(1)
-			endpoint := endpoint
+			server := server
 			go func() {
 				defer sm.wg.Done()
-				resp, err := sm.clients[endpoint].RequestVote(ctx, req)
+				resp, err := sm.clients[server].RequestVote(ctx, req)
 				if err != nil {
-					log.Debug("Failed to send RequestVote to %q: %v", endpoint, err)
+					log.Debug("Failed to send RequestVote to %q(%q): %v", server, sm.cluster.Servers[server], err)
 				}
 				select {
 				case sm.msgCh <- resp:
@@ -522,20 +522,20 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 		return fmt.Errorf("failed to get current term: %v", err)
 	}
 
-	for _, endpoint := range sm.cluster.Endpoints {
-		if endpoint != sm.cluster.LocalEndpoint {
-			prevLogIndex := sm.nextIndex[endpoint] - 1
+	for server := range sm.cluster.Servers {
+		if server != sm.cluster.LocalServerName {
+			prevLogIndex := sm.nextIndex[server] - 1
 			prevLogTerm, err := sm.storage.GetLogTerm(prevLogIndex)
 			if err != nil {
 				return fmt.Errorf("failed to get log term at index %d: %v", prevLogIndex, err)
 			}
-			entries, err := sm.storage.GetLogsFrom(sm.nextIndex[endpoint])
+			entries, err := sm.storage.GetLogsFrom(sm.nextIndex[server])
 			if err != nil {
-				return fmt.Errorf("failed to get logs from index %d: %v", sm.nextIndex[endpoint], err)
+				return fmt.Errorf("failed to get logs from index %d: %v", sm.nextIndex[server], err)
 			}
 			req := &konsen.AppendEntriesReq{
 				Term:         currentTerm,
-				LeaderId:     sm.cluster.LocalEndpoint,
+				LeaderId:     sm.cluster.LocalServerName,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  prevLogTerm,
 				Entries:      entries,
@@ -543,19 +543,19 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 			}
 
 			sm.wg.Add(1)
-			endpoint := endpoint
+			server := server
 			go func() {
 				defer sm.wg.Done()
-				resp, err := sm.clients[endpoint].AppendEntries(ctx, req)
+				resp, err := sm.clients[server].AppendEntries(ctx, req)
 				if err != nil {
-					log.Debug("Failed to send AppendEntries to %q: %v", endpoint, err)
+					log.Debug("Failed to send AppendEntries to %q(%q): %v", server, sm.cluster.Servers[server], err)
 					return
 				}
 				select {
 				case sm.msgCh <- appendEntriesRespWrap{
-					resp:     resp,
-					req:      req,
-					endpoint: endpoint,
+					resp:   resp,
+					req:    req,
+					server: server,
 				}:
 				case <-sm.stopCh:
 				}
@@ -586,7 +586,7 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	}
 
 	// 2. Vote for self.
-	if err := sm.storage.SetVotedFor(sm.cluster.LocalEndpoint); err != nil {
+	if err := sm.storage.SetVotedFor(sm.cluster.LocalServerName); err != nil {
 		return fmt.Errorf("failed to set votedFor: %v", err)
 	}
 	sm.numVotes++
@@ -678,7 +678,7 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					}
 					v.ch <- resp
 				case appendEntriesRespWrap:
-					if err := sm.handleAppendEntriesResp(v.resp, v.req, v.endpoint); err != nil {
+					if err := sm.handleAppendEntriesResp(v.resp, v.req, v.server); err != nil {
 						log.Fatalf("%v", err)
 					}
 				case *konsen.RequestVoteResp:
