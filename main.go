@@ -18,6 +18,7 @@ import (
 	"github.com/lizhaoliu/konsen/v2/core"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 	"github.com/lizhaoliu/konsen/v2/rpc"
+	"github.com/lizhaoliu/konsen/v2/store"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
@@ -102,7 +103,7 @@ func main() {
 		logrus.Fatalf("%v", err)
 	}
 
-	storage, err := core.NewBoltDB(core.BoltDBConfig{FilePath: dbFilePath})
+	storage, err := store.NewBoltDB(store.BoltDBConfig{FilePath: dbFilePath})
 	if err != nil {
 		logrus.Fatalf("%v", err)
 	}

@@ -1,4 +1,4 @@
-package core
+package store
 
 import konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 

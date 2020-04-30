@@ -9,6 +9,7 @@ import (
 	"time"
 
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	"github.com/lizhaoliu/konsen/v2/store"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -32,7 +33,7 @@ type StateMachine struct {
 	resetTimerCh chan struct{}    // Signals to reset election timer when AppendEntries or RequestVote requests/response are received.
 
 	// Persistent state storage on all servers.
-	storage Storage
+	storage store.Storage
 
 	// Volatile state on all servers.
 	commitIndex   uint64      // Index of highest log entry known to be committed (initialized to 0).
@@ -60,7 +61,7 @@ type StateMachine struct {
 
 // StateMachineConfig
 type StateMachineConfig struct {
-	Storage Storage                // Local storage instance.
+	Storage store.Storage          // Local storage instance.
 	Cluster *ClusterConfig         // Cluster configuration.
 	Clients map[string]RaftService // A map of {endpoint: client instance}.
 }
