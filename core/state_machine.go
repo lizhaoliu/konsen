@@ -14,9 +14,11 @@ import (
 )
 
 const (
-	defaultMinTimeout  = 500 * time.Millisecond
-	defaultTimeoutSpan = 500 * time.Millisecond
-	defaultHeartbeat   = 50 * time.Millisecond
+	defaultMinTimeout  = 150 * time.Millisecond
+	defaultTimeoutSpan = 150 * time.Millisecond
+	defaultHeartbeat   = 20 * time.Millisecond
+
+	defaultRequestTimeout = 5 * time.Second
 )
 
 // StateMachine is the state machine that implements Raft algorithm: https://raft.github.io/raft.pdf.
@@ -54,9 +56,7 @@ type StateMachine struct {
 
 	wg sync.WaitGroup
 
-	// Guard the condition where a certain log is replicated on quorum.
-	mut  sync.Mutex
-	cond *sync.Cond
+	condMap sync.Map
 }
 
 // StateMachineConfig
@@ -146,7 +146,6 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 		nextIndex:  make(map[string]uint64),
 		matchIndex: make(map[string]uint64),
 	}
-	sm.cond = sync.NewCond(&sm.mut)
 
 	return sm, nil
 }
@@ -624,8 +623,12 @@ func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) 
 		if err := applyCommand(logEntry.GetData()); err != nil {
 			return fmt.Errorf("failed to apply command from log at index %d", sm.lastApplied)
 		}
-		// Notifies if there are goroutines that are waiting on logs being applied.
-		sm.cond.Broadcast()
+		// Notifies if there is a goroutine waiting on log[lastApplied] being applied.
+		condCh, ok := sm.condMap.Load(sm.lastApplied)
+		if ok {
+			condCh := condCh.(chan struct{})
+			close(condCh)
+		}
 		log.Debug("Applied log at index %d", sm.lastApplied)
 	}
 	return nil
@@ -846,17 +849,23 @@ func (sm *StateMachine) forwardRequestToLeader(req *konsen.AppendDataReq, ch cha
 
 // replyWhenLogApplied starts a new goroutine to reply request after new log is applied to local state machine.
 func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.AppendDataResp) {
+	condCh := make(chan struct{})
+	sm.condMap.Store(logIndex, condCh)
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
-		sm.cond.L.Lock()
-		for sm.lastApplied < logIndex {
-			// TODO: add timeout mechanism.
-			sm.cond.Wait()
+		select {
+		case <-condCh:
+			sm.condMap.Delete(logIndex)
+			log.Debug("Log[%d] is committed and applied on local state machine.", logIndex)
+			ch <- &konsen.AppendDataResp{Success: true}
+		case <-time.After(defaultRequestTimeout):
+			log.Debug("Timeout while waiting for log[%d] to be committed and applied.", logIndex)
+			ch <- &konsen.AppendDataResp{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("failed to replicate onto quorum and apply commands (are there more than %d nodes down?)", len(sm.cluster.Servers)/2),
+			}
 		}
-		sm.cond.L.Unlock()
-		log.Debug("Log(%d) is committed and applied on local state machine.", logIndex)
-		ch <- &konsen.AppendDataResp{Success: true}
 	}()
 }
 

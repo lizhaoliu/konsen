@@ -150,7 +150,7 @@ func main() {
 				logrus.Errorf("%v", err)
 			}
 			if !resp.GetSuccess() {
-				logrus.Errorf("%v (more than %d nodes down?)", resp.GetErrorMessage(), len(cluster.Servers)/2)
+				logrus.Errorf("%v", resp.GetErrorMessage())
 			}
 		case strings.HasPrefix(line, "get "):
 			key := line[4:]
