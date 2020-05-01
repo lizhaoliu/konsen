@@ -78,7 +78,7 @@ type Snapshot struct {
 	MatchIndex    map[string]uint64 // For each server, index of highest log entry known to be replicated on that server (initialized to 0, increases monotonically).
 	LogIndices    []uint64          // Logs indices.
 	LogTerms      []uint64          // Log terms.
-	LogSizes      []int             // Log binary sizes.
+	LogBytes      []int             // Log binary sizes.
 }
 
 // appendEntriesWrap
@@ -357,7 +357,7 @@ func (sm *StateMachine) isLogOnMajority(logIndex uint64) bool {
 			n++
 		}
 	}
-	return n > len(sm.cluster.Servers)/2
+	return n > sm.getQuorum()
 }
 
 // handleRequestVote handles a RequestVote request.
@@ -437,7 +437,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 	if resp.GetVoteGranted() {
 		sm.numVotes++
 		// If votes received from majority of servers, become leader.
-		if sm.numVotes > len(sm.cluster.Servers)/2 {
+		if sm.numVotes > sm.getQuorum() {
 			if err := sm.becomeLeader(currentTerm); err != nil {
 				return fmt.Errorf("failed to become leader: %v", err)
 			}
@@ -796,11 +796,24 @@ func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataRe
 	}
 }
 
+func (sm *StateMachine) getQuorum() int {
+	return len(sm.cluster.Servers) / 2
+}
+
 // handleAppendData processes a appendDataMsg, it writes the data into local (or on leader's) logs, returns after the
 // data is applied to local state machine.
 // The message loop goroutine should NEVER block in this method since it depends on subsequent AppendEntriesResp in
 // order to determine which log is committed, otherwise it will deadlock.
 func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) error {
+	// If no leader is elected, put the message back to message queue.
+	if sm.currentLeader == "" {
+		ch <- &konsen.AppendDataResp{
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("no leader is elected yet (are there more than %d nodes down?)", sm.getQuorum()),
+		}
+		return nil
+	}
+
 	// Only leader writes data to its logs.
 	if sm.role != konsen.Role_LEADER {
 		// Forward the request to leader.
@@ -808,27 +821,36 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 		return nil
 	}
 
-	lastLogIndex, err := sm.storage.LastLogIndex()
+	// Writes data into a new log entry next to the last log.
+	newLog, err := sm.writeToLogs(req.GetData())
 	if err != nil {
-		return fmt.Errorf("failed to get last log index: %v", err)
+		return err
 	}
-	currentTerm, err := sm.storage.GetCurrentTerm()
-	if err != nil {
-		return fmt.Errorf("failed to get current term: %v", err)
-	}
-	newLog := &konsen.Log{
-		Index: lastLogIndex + 1,
-		Term:  currentTerm,
-		Data:  req.GetData(),
-	}
-	if err := sm.storage.WriteLog(newLog); err != nil {
-		return fmt.Errorf("failed to write log: %v", err)
-	}
-	log.Debug("Log written: index - %d, term - %d, bytes - %d.", newLog.GetIndex(), newLog.GetTerm(), len(newLog.GetData()))
 
 	// Starts a new goroutine to wait until the new log is committed (replicated on quorum) and applied to local state machine.
 	sm.replyWhenLogApplied(newLog.GetIndex(), ch)
 	return nil
+}
+
+func (sm *StateMachine) writeToLogs(data []byte) (*konsen.Log, error) {
+	lastLogIndex, err := sm.storage.LastLogIndex()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get last log index: %v", err)
+	}
+	currentTerm, err := sm.storage.GetCurrentTerm()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current term: %v", err)
+	}
+	newLog := &konsen.Log{
+		Index: lastLogIndex + 1,
+		Term:  currentTerm,
+		Data:  data,
+	}
+	if err := sm.storage.WriteLog(newLog); err != nil {
+		return nil, fmt.Errorf("failed to write log: %v", err)
+	}
+	log.Debug("Log written: index - %d, term - %d, bytes - %d.", newLog.GetIndex(), newLog.GetTerm(), len(newLog.GetData()))
+	return newLog, nil
 }
 
 // forwardRequestToLeader starts a new goroutine to send request to current leader, and the goroutine replies after receiving result from leader.
@@ -863,7 +885,7 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 			log.Debug("Timeout while waiting for log[%d] to be committed and applied.", logIndex)
 			ch <- &konsen.AppendDataResp{
 				Success:      false,
-				ErrorMessage: fmt.Sprintf("failed to replicate onto quorum and apply commands (are there more than %d nodes down?)", len(sm.cluster.Servers)/2),
+				ErrorMessage: fmt.Sprintf("failed to replicate onto quorum and apply commands (are there more than %d nodes down?)", sm.getQuorum()),
 			}
 		}
 	}()
@@ -899,11 +921,11 @@ func (sm *StateMachine) handleGetSnapshot() (*Snapshot, error) {
 	}
 	logIndices := make([]uint64, len(logs))
 	logTerms := make([]uint64, len(logs))
-	logSizes := make([]int, len(logs))
+	logBytes := make([]int, len(logs))
 	for i, e := range logs {
 		logIndices[i] = e.GetIndex()
 		logTerms[i] = e.GetTerm()
-		logSizes[i] = len(e.GetData())
+		logBytes[i] = len(e.GetData())
 	}
 	return &Snapshot{
 		CurrentTerm:   currentTerm,
@@ -915,7 +937,7 @@ func (sm *StateMachine) handleGetSnapshot() (*Snapshot, error) {
 		MatchIndex:    matchIndexMap,
 		LogIndices:    logIndices,
 		LogTerms:      logTerms,
-		LogSizes:      logSizes,
+		LogBytes:      logBytes,
 	}, nil
 }
 

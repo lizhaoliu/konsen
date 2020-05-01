@@ -12,12 +12,14 @@ failures.
 #### Cluster configuration
 Edit the cluster config in `conf/cluster.yml`, for example: 
 ```yaml
-endpoints:
-  - 192.168.86.25:10001
-  - 192.168.86.25:10002
-  - 192.168.86.25:10003
+servers:
+  node1: "192.168.86.25:10001"
+  node2: "192.168.86.25:10002"
+  node3: "192.168.86.25:10003"
+  node4: "192.168.86.25:10004"
+  node5: "192.168.86.25:10005"
 ```
-This creates a cluster of 3 nodes.
+This creates a cluster of 5 nodes.
 #### (Optional) Regenerate protobuf code
 ```shell script
 protoc -I=proto --go_out=plugins=grpc:proto_gen proto/*.proto
@@ -29,15 +31,15 @@ python build_cluster.py
 This will build a release for each node in the cluster config. 
 ```
 output/
-  node_0/
+  node1/
     bootstrap.sh
     cluster.yml
     konsen
-  node_1/
+  node2/
     bootstrap.sh
     cluster.yml
     konsen
-  node_2/
+  node3/
     bootstrap.sh
     cluster.yml
     konsen
