@@ -2,22 +2,19 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
-	"github.com/chzyer/readline"
+	"github.com/gin-gonic/gin"
 	"github.com/lizhaoliu/konsen/v2/core"
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 	"github.com/lizhaoliu/konsen/v2/rpc"
 	"github.com/lizhaoliu/konsen/v2/store"
+	"github.com/lizhaoliu/konsen/v2/web/httpserver"
 	"github.com/sirupsen/logrus"
 )
 
@@ -45,6 +42,8 @@ func init() {
 		FullTimestamp: true,
 	})
 	logrus.SetLevel(logrus.InfoLevel)
+
+	gin.SetMode(gin.ReleaseMode)
 }
 
 func createClients(cluster *core.ClusterConfig) (map[string]core.RaftService, error) {
@@ -90,17 +89,26 @@ func main() {
 		logrus.Fatalf("Failed to create state machine: %v", err)
 	}
 
-	server := rpc.NewRaftGRPCServer(rpc.RaftGRPCServerConfig{
+	raftServer := rpc.NewRaftGRPCServer(rpc.RaftGRPCServerConfig{
 		Endpoint:     cluster.Servers[cluster.LocalServerName],
 		StateMachine: sm,
 	})
+
+	httpSrv := httpserver.NewServer(httpserver.ServerConfig{
+		StateMachine: sm,
+		Address:      cluster.HttpServers[cluster.LocalServerName],
+	})
+
 	go func() {
-		if err := server.Serve(); err != nil {
+		if err := raftServer.Serve(); err != nil {
 			logrus.Fatalf("%v", err)
 		}
 	}()
 	go func() {
 		sm.Run(ctx)
+	}()
+	go func() {
+		logrus.Errorln(httpSrv.Run())
 	}()
 
 	if pprofPort > 0 {
@@ -113,63 +121,8 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		logrus.Infof("Syscall: %v", sig)
-
-		sm.Close()
-		server.Stop()
-		storage.Close()
-	}()
-
-	l, err := readline.New("\033[31m»\033[0m ")
-	if err != nil {
-		logrus.Fatalf("%v", err)
-	}
-	defer l.Close()
-
-	logrus.SetOutput(l.Stderr())
-	for {
-		line, err := l.Readline()
-		if err == readline.ErrInterrupt {
-			if len(line) == 0 {
-				break
-			} else {
-				continue
-			}
-		} else if err == io.EOF {
-			break
-		}
-
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "set "):
-			data := line[4:]
-			resp, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: []byte(data)})
-			if err != nil {
-				logrus.Errorf("%v", err)
-			}
-			if !resp.GetSuccess() {
-				logrus.Errorf("%v", resp.GetErrorMessage())
-			}
-		case strings.HasPrefix(line, "get "):
-			key := line[4:]
-			val, err := sm.GetValue(ctx, []byte(key))
-			if err != nil {
-				logrus.Errorf("%v", err)
-			}
-			logrus.Infof("%s", val)
-		case line == "snapshot":
-			s, err := sm.GetSnapshot(ctx)
-			if err != nil {
-				logrus.Errorf("%v", err)
-			} else {
-				buf, err := json.MarshalIndent(s, "", "  ")
-				if err != nil {
-					logrus.Errorf("%v", err)
-				}
-				logrus.Infof("\n%s", buf)
-			}
-		}
-	}
+	<-sigCh
+	sm.Close()
+	raftServer.Stop()
+	storage.Close()
 }

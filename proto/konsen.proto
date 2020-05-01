@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package konsen;
+
+option go_package = ".;konsen";
+
+message KV {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message KVList {
+  repeated KV kv_list = 1;
+}

@@ -13,7 +13,7 @@ enum Role {
 message Log {
   uint64 index = 1; // Index of the log entry (first index is 1).
   uint64 term = 2;  // Term of the log entry.
-  bytes data = 3;   // Raw data that the log entry encapsulates.
+  bytes data = 3;   // Raw data/command that the log entry encapsulates.
 }
 
 message AppendEntriesReq {
@@ -43,7 +43,7 @@ message RequestVoteResp {
 }
 
 message AppendDataReq {
-  bytes data = 1;
+  bytes data = 1; // Raw data/command that is to be stored and applied to state machine.
 }
 
 message AppendDataResp {

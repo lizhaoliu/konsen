@@ -85,7 +85,7 @@ type Log struct {
 
 	Index uint64 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"` // Index of the log entry (first index is 1).
 	Term  uint64 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`   // Term of the log entry.
-	Data  []byte `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`    // Raw data that the log entry encapsulates.
+	Data  []byte `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`    // Raw data/command that the log entry encapsulates.
 }
 
 func (x *Log) Reset() {
@@ -414,7 +414,7 @@ type AppendDataReq struct {
 	sizeCache     protoimpl.SizeCache
 	unknownFields protoimpl.UnknownFields
 
-	Data []byte `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
+	Data []byte `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"` // Raw data/command that is to be stored and applied to state machine.
 }
 
 func (x *AppendDataReq) Reset() {

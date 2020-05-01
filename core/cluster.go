@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"io/ioutil"
 
-	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
 
 // ClusterConfig is the configuration of a cluster.
 type ClusterConfig struct {
-	Servers         map[string]string `yaml:"servers"`                   // All servers in the cluster, a map of "serverName": "serverEndpoint".
+	Servers         map[string]string `yaml:"servers"`                   // All servers in the cluster, a map of "serverName": "serverAddress".
+	HttpServers     map[string]string `yaml:"httpServers"`               // All HTTP servers in the cluster, a map of "serverName": "httpServerAddress".
 	LocalServerName string            `yaml:"localServerName,omitempty"` // Local server name.
 }
 
@@ -34,8 +34,6 @@ func ParseClusterConfig(cfgFilePath string) (*ClusterConfig, error) {
 	if numNodes%2 != 1 {
 		return nil, fmt.Errorf("number of nodes in a cluster must be odd, got: %d", numNodes)
 	}
-
-	logrus.Infof("Cluster endpoints: %q", cluster.Servers)
 
 	for server := range cluster.Servers {
 		if cluster.LocalServerName == server {

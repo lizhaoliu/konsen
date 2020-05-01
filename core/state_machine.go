@@ -4,19 +4,19 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
 	"github.com/lizhaoliu/konsen/v2/store"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	defaultMinTimeout  = 150 * time.Millisecond
-	defaultTimeoutSpan = 150 * time.Millisecond
-	defaultHeartbeat   = 20 * time.Millisecond
+	defaultMinTimeout  = 1000 * time.Millisecond
+	defaultTimeoutSpan = 1000 * time.Millisecond
+	defaultHeartbeat   = 100 * time.Millisecond
 
 	defaultRequestTimeout = 5 * time.Second
 )
@@ -54,7 +54,8 @@ type StateMachine struct {
 	cluster *ClusterConfig
 	clients map[string]RaftService
 
-	wg sync.WaitGroup
+	wg   sync.WaitGroup
+	once sync.Once
 
 	condMap sync.Map
 }
@@ -152,9 +153,11 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 
 // Run starts the state machine and blocks until done.
 func (sm *StateMachine) Run(ctx context.Context) {
-	sm.startMessageLoop(ctx)
-	sm.startElectionLoop(ctx)
-	sm.wg.Wait()
+	sm.once.Do(func() {
+		sm.startMessageLoop(ctx)
+		sm.startElectionLoop(ctx)
+		sm.wg.Wait()
+	})
 }
 
 // AppendEntries puts the incoming AppendEntries request in main message channel and waits for result.
@@ -643,14 +646,17 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 
 		for {
 			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
-			if err := sm.maybeApplyLogs(func(command []byte) error {
-				// TODO: make this function configurable by users.
-				cmdStr := string(command)
-				kv := strings.Split(cmdStr, "=")
-				if len(kv) != 2 {
-					return fmt.Errorf("malformed kv pair, should be 'key=value'")
+			if err := sm.maybeApplyLogs(func(data []byte) error {
+				kvs := &konsen.KVList{}
+				if err := proto.Unmarshal(data, kvs); err != nil {
+					return err
 				}
-				return sm.storage.SetValue([]byte(kv[0]), []byte(kv[1]))
+				for _, kv := range kvs.GetKvList() {
+					if err := sm.storage.SetValue(kv.GetKey(), kv.GetValue()); err != nil {
+						return err
+					}
+				}
+				return nil
 			}); err != nil {
 				log.Fatalf("%v", err)
 			}
@@ -941,6 +947,21 @@ func (sm *StateMachine) handleGetSnapshot() (*Snapshot, error) {
 	}, nil
 }
 
+func (sm *StateMachine) SetKeyValue(ctx context.Context, kv *konsen.KVList) error {
+	buf, err := proto.Marshal(kv)
+	if err != nil {
+		return fmt.Errorf("failed to marshal: %v", err)
+	}
+	resp, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: buf})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf(resp.ErrorMessage)
+	}
+	return nil
+}
+
 func (sm *StateMachine) GetValue(ctx context.Context, key []byte) ([]byte, error) {
 	ch := make(chan []byte)
 	sm.msgCh <- getValueMsg{key: key, ch: ch}
@@ -958,5 +979,6 @@ func (sm *StateMachine) handleGetValue(key []byte) ([]byte, error) {
 
 func (sm *StateMachine) Close() error {
 	close(sm.stopCh)
+	sm.wg.Wait()
 	return nil
 }
