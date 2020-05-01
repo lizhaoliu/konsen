@@ -1,7 +1,7 @@
 # konsen
 ### Overview
-konsen is an implementation of [Raft](https://raft.github.io/raft.pdf) consensus protocol based upon replicated state
-machine. konson offers strong consistency and partition tolerance. For a cluster of N nodes, it can tolerate up to N/2
+Konsen is an implementation of [Raft](https://raft.github.io/raft.pdf) consensus protocol based upon replicated state
+machine. Konson offers strong consistency and partition tolerance. For a cluster of N nodes, it can tolerate up to N/2
 failures.
 ### Features
 - [x] Consensus with replicated state machine.
@@ -13,13 +13,20 @@ failures.
 Edit the cluster config in `conf/cluster.yml`, for example: 
 ```yaml
 servers:
-  node1: "192.168.86.25:10001"
-  node2: "192.168.86.25:10002"
-  node3: "192.168.86.25:10003"
-  node4: "192.168.86.25:10004"
-  node5: "192.168.86.25:10005"
+  node1: 192.168.86.25:10001
+  node2: 192.168.86.25:10002
+  node3: 192.168.86.25:10003
+  node4: 192.168.86.25:10004
+  node5: 192.168.86.25:10005
+httpServers:
+  node1: 192.168.86.25:20001
+  node2: 192.168.86.25:20002
+  node3: 192.168.86.25:20003
+  node4: 192.168.86.25:20004
+  node5: 192.168.86.25:20005
 ```
-This creates a cluster of 5 nodes.
+This creates a cluster of 5 nodes, where "httpServers" define the HTTP servers that accept client request such as writes
+and reads.
 #### (Optional) Regenerate protobuf code
 ```shell script
 protoc -I=proto --go_out=plugins=grpc:proto_gen proto/*.proto
@@ -45,31 +52,22 @@ output/
     konsen
   ...
 ```
-#### Run (key-value store example)
-Start a cluster of 5 nodes, and one becomes a leader
-```
-INFO[2020-04-29T21:54:57-07:00] Cluster endpoints: ["192.168.86.25:10001" "192.168.86.25:10002" "192.168.86.25:10003" "192.168.86.25:10004" "192.168.86.25:10005"] 
-INFO[2020-04-29T21:54:57-07:00] BoltDB storage file set to: ...
-INFO[2020-04-29T21:54:57-07:00] Start konsen server on: "192.168.86.25:10003" 
-INFO[2020-04-29T21:54:59-07:00] Term - 5, leader - "192.168.86.25:10003".
-```
-Set a key-value from a non-leader node
-```
-INFO[2020-04-29T21:54:59-07:00] Cluster endpoints: ["192.168.86.25:10001" "192.168.86.25:10002" "192.168.86.25:10003" "192.168.86.25:10004" "192.168.86.25:10005"] 
-INFO[2020-04-29T21:54:59-07:00] BoltDB storage file set to: ...
-INFO[2020-04-29T21:54:59-07:00] Start konsen server on: "192.168.86.25:10005" 
-» set name=Lizhao Liu
-```
-Get value by key from another node
-```
-INFO[2020-04-29T21:54:58-07:00] Cluster endpoints: ["192.168.86.25:10001" "192.168.86.25:10002" "192.168.86.25:10003" "192.168.86.25:10004" "192.168.86.25:10005"] 
-INFO[2020-04-29T21:54:58-07:00] BoltDB storage file set to: ...
-INFO[2020-04-29T21:54:58-07:00] Start konsen server on: "192.168.86.25:10004" 
-» get name
-INFO[2020-04-29T21:55:43-07:00] Lizhao Liu 
-```
+### Benchmark
+####Setup
+* go version go1.14.2 linux/amd64.
+* 5 nodes on local machine, AMD 3900x 12 cores + 32GB Ram + 256GB SSD.
+* Ubuntu 19.10.
+* Benchmark tool: [Vegeta](https://github.com/tsenart/vegeta).
+#### Write 
+All write requests will be redirected to leader node, leader writes to local logs and then replicates to majority of
+nodes such that it applies to local state machine.
+
+[TODO]
+#### Read
+[TODO]
 ### TODO
 - [ ] Unit tests.
+- [ ] Supervisors.
 - [ ] Log compaction.
 - [ ] Cluster resize.
 - [ ] HTTP server.
