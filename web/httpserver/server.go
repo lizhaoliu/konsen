@@ -1,9 +1,9 @@
 package httpserver
 
-import "C"
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lizhaoliu/konsen/v2/core"
@@ -13,9 +13,9 @@ import (
 const serviceRelPath = "/konsen"
 
 type Server struct {
-	sm     *core.StateMachine
-	addr   string
-	router *gin.Engine
+	sm         *core.StateMachine
+	router     *gin.Engine
+	httpServer *http.Server
 }
 
 type ServerConfig struct {
@@ -26,12 +26,26 @@ type ServerConfig struct {
 func NewServer(config ServerConfig) *Server {
 	router := gin.Default()
 
-	s := &Server{
-		sm:     config.StateMachine,
-		addr:   config.Address,
-		router: router,
+	httpServer := &http.Server{
+		Addr:         config.Address,
+		Handler:      router,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
+	httpServer.SetKeepAlivesEnabled(false)
+
+	s := &Server{
+		sm:         config.StateMachine,
+		router:     router,
+		httpServer: httpServer,
+	}
+
 	return s
+}
+
+func (s *Server) initialize() {
+	s.router.GET(serviceRelPath, s.getHandler)
+	s.router.POST(serviceRelPath, s.postHandler)
 }
 
 func (s *Server) getHandler(c *gin.Context) {
@@ -71,7 +85,5 @@ func (s *Server) postHandler(c *gin.Context) {
 }
 
 func (s *Server) Run() error {
-	s.router.GET(serviceRelPath, s.getHandler)
-	s.router.POST(serviceRelPath, s.postHandler)
-	return s.router.Run(s.addr)
+	return s.httpServer.ListenAndServe()
 }
