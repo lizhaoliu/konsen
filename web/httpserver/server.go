@@ -40,6 +40,8 @@ func NewServer(config ServerConfig) *Server {
 		httpServer: httpServer,
 	}
 
+	s.initialize()
+
 	return s
 }
 

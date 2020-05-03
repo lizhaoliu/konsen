@@ -59,12 +59,28 @@ output/
 * Ubuntu 19.10.
 * Benchmark tool: [Vegeta](https://github.com/tsenart/vegeta).
 #### Write 
-All write requests will be redirected to leader node, leader writes to local logs and then replicates to majority of
-nodes such that it applies to local state machine.
-
-[TODO]
+All write requests will be redirected to the leader node: leader writes to local log and then replicates it to all (at
+least majority of) nodes such that it applies to local state machine, and responds to the request.
+```shell script
+Requests      [total, rate, throughput]  2500, 500.21, 495.11
+Duration      [total, attack, wait]      5.049347643s, 4.997898254s, 51.449389ms
+Latencies     [mean, 50, 95, 99, max]    82.190365ms, 79.205946ms, 113.411489ms, 126.342645ms, 154.046802ms
+Bytes In      [total, mean]              0, 0.00
+Bytes Out     [total, mean]              37500, 15.00
+Success       [ratio]                    100.00%
+Status Codes  [code:count]               200:2500
+```
 #### Read
-[TODO]
+All read requests will be redirected to the leader node.
+```shell script
+Requests      [total, rate, throughput]  50000, 9994.47, 9990.42
+Duration      [total, attack, wait]      5.004796803s, 5.002768278s, 2.028525ms
+Latencies     [mean, 50, 95, 99, max]    484.303µs, 218.459µs, 662.541µs, 9.176152ms, 42.321458ms
+Bytes In      [total, mean]              0, 0.00
+Bytes Out     [total, mean]              0, 0.00
+Success       [ratio]                    100.00%
+Status Codes  [code:count]               200:50000  
+```
 ### TODO
 - [ ] Unit tests.
 - [ ] Supervisors.
