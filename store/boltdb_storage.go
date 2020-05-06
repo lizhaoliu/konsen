@@ -1,8 +1,6 @@
 package store
 
 import (
-	"encoding/binary"
-
 	"github.com/boltdb/bolt"
 	"github.com/golang/protobuf/proto"
 	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
@@ -15,9 +13,6 @@ var (
 	statesBucketName = []byte("states")
 	// Additional buckets.
 	kvBucketName = []byte("kv")
-
-	currentTermKey = []byte("current_term")
-	votedForKey    = []byte("voted_for")
 )
 
 // BoltDB is a storage implementation utilizing Bolt file database.
@@ -31,7 +26,7 @@ type BoltDBConfig struct {
 }
 
 func NewBoltDB(config BoltDBConfig) (*BoltDB, error) {
-	logrus.Infof("BoltDB storage file set to: %s", config.FilePath)
+	logrus.Infof("BoltDB local log file set to: %s", config.FilePath)
 	db, err := bolt.Open(config.FilePath, 0600, nil)
 	if err != nil {
 		return nil, err
@@ -191,22 +186,6 @@ func (b *BoltDB) DeleteLogsFrom(minLogIndex uint64) error {
 	})
 }
 
-func (b *BoltDB) FirstLogIndex() (uint64, error) {
-	var index uint64
-	if err := b.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(logsBucketName).Cursor()
-		buf, _ := c.First()
-		if buf == nil {
-			return nil
-		}
-		index = bytesToUint64(buf)
-		return nil
-	}); err != nil {
-		return 0, err
-	}
-	return index, nil
-}
-
 func (b *BoltDB) LastLogIndex() (uint64, error) {
 	var index uint64
 	if err := b.db.View(func(tx *bolt.Tx) error {
@@ -221,26 +200,6 @@ func (b *BoltDB) LastLogIndex() (uint64, error) {
 		return 0, err
 	}
 	return index, nil
-}
-
-func (b *BoltDB) FirstLogTerm() (uint64, error) {
-	var term uint64
-	if err := b.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(logsBucketName).Cursor()
-		_, buf := c.First()
-		if buf == nil {
-			return nil
-		}
-		log := &konsen.Log{}
-		if err := proto.Unmarshal(buf, log); err != nil {
-			return err
-		}
-		term = log.GetTerm()
-		return nil
-	}); err != nil {
-		return 0, err
-	}
-	return term, nil
 }
 
 func (b *BoltDB) LastLogTerm() (uint64, error) {
@@ -289,14 +248,4 @@ func (b *BoltDB) GetValue(key []byte) ([]byte, error) {
 
 func (b *BoltDB) Close() error {
 	return b.db.Close()
-}
-
-func bytesToUint64(b []byte) uint64 {
-	return binary.BigEndian.Uint64(b)
-}
-
-func uint64ToBytes(v uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, v)
-	return b
 }

@@ -1,6 +1,8 @@
 package store
 
-import konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+import (
+	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+)
 
 // Storage provides an interface for a set of local persistent storage operations.
 type Storage interface {
@@ -31,14 +33,8 @@ type Storage interface {
 	// WriteLogs writes the given log entries into storage.
 	WriteLogs(logs []*konsen.Log) error
 
-	// FirstLogIndex returns the first(oldest) log entry's index.
-	FirstLogIndex() (uint64, error)
-
 	// LastLogIndex returns the last(newest) log entry's index.
 	LastLogIndex() (uint64, error)
-
-	// FirstLogTerm returns the first(oldest) log entry's term.
-	FirstLogTerm() (uint64, error)
 
 	// LastLogTerm returns the last(newest) log entry's term.
 	LastLogTerm() (uint64, error)

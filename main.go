@@ -8,6 +8,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path"
 	"syscall"
 
 	"github.com/gin-gonic/gin"
@@ -20,21 +21,19 @@ import (
 
 var (
 	clusterConfigPath string
-	dbFilePath        string
-	pprofPort         int
+	dbDir             string
 )
 
 func init() {
 	flag.StringVar(&clusterConfigPath, "cluster_config_path", "", "Cluster configuration file path.")
-	flag.StringVar(&dbFilePath, "db_file_path", "", "Local DB file path.")
-	flag.IntVar(&pprofPort, "pprof_port", 0, "pprof HTTP server port, 0 means no pprof.")
+	flag.StringVar(&dbDir, "db_dir", "db", "Local database directory path.")
 	flag.Parse()
 
 	if clusterConfigPath == "" {
 		logrus.Fatalf("cluster_config_path is unspecified.")
 	}
-	if dbFilePath == "" {
-		logrus.Fatalf("db_file_path is unspecified.")
+	if dbDir == "" {
+		logrus.Fatalf("db_dir is unspecified.")
 	}
 
 	logrus.SetOutput(os.Stdout)
@@ -70,7 +69,13 @@ func main() {
 		logrus.Fatalf("%v", err)
 	}
 
-	storage, err := store.NewBoltDB(store.BoltDBConfig{FilePath: dbFilePath})
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		logrus.Fatalf("Failed to create dir: %v", err)
+	}
+	storage, err := store.NewBadger(store.BadgerConfig{
+		LogDir:   path.Join(dbDir, "logs"),
+		StateDir: path.Join(dbDir, "state"),
+	})
 	if err != nil {
 		logrus.Fatalf("%v", err)
 	}
@@ -104,20 +109,22 @@ func main() {
 			logrus.Fatalf("%v", err)
 		}
 	}()
+	//
 	go func() {
 		sm.Run(ctx)
 	}()
 	go func() {
-		logrus.Errorln(httpSrv.Run())
+		if err := httpSrv.Run(); err != nil {
+			logrus.Fatalf("Failed to start HTTP server: %v", err)
+		}
 	}()
 
-	if pprofPort > 0 {
-		go func() {
-			if err := http.ListenAndServe(fmt.Sprintf(":%d", pprofPort), nil); err != nil {
-				logrus.Errorf("Failed to start pprof server: %v", err)
-			}
-		}()
-	}
+	// Starts pprof server.
+	go func() {
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			logrus.Errorf("Failed to start pprof server: %v", err)
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
