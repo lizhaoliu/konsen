@@ -158,6 +158,7 @@ func (b *Badger) LastLogIndex() (uint64, error) {
 	if err := b.logDB.View(func(txn *badger.Txn) error {
 		itOpt := badger.DefaultIteratorOptions
 		itOpt.Reverse = true
+		itOpt.PrefetchValues = false
 		it := txn.NewIterator(itOpt)
 		defer it.Close()
 		it.Rewind()
@@ -176,6 +177,7 @@ func (b *Badger) LastLogTerm() (uint64, error) {
 	if err := b.logDB.View(func(txn *badger.Txn) error {
 		itOpt := badger.DefaultIteratorOptions
 		itOpt.Reverse = true
+		itOpt.PrefetchValues = false
 		it := txn.NewIterator(itOpt)
 		defer it.Close()
 		it.Rewind()
@@ -203,7 +205,6 @@ func (b *Badger) DeleteLogsFrom(minLogIndex uint64) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 		for it.Seek(uint64ToBytes(minLogIndex)); it.Valid(); it.Next() {
-			// TODO: not sure if this would result in concurrent modification error.
 			if err := txn.Delete(it.Item().Key()); err != nil {
 				return err
 			}
