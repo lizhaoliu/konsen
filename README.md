@@ -29,7 +29,7 @@ This creates a cluster of 5 nodes, where "httpServers" define the HTTP servers t
 and reads.
 #### (Optional) Regenerate protobuf code
 ```shell script
-protoc -I=proto --go_out=plugins=grpc:proto_gen proto/*.proto
+protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative proto/*.proto
 ```
 #### Build cluster
 ```shell script

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package konsen;
 
-option go_package = ".;konsen";
+option go_package = "./;konsen";
 
 message KV {
   bytes key = 1;

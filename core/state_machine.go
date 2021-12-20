@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"github.com/lizhaoliu/konsen/v2/store"
 	log "github.com/sirupsen/logrus"
 )

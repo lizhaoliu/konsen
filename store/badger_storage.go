@@ -3,7 +3,7 @@ package store
 import (
 	"github.com/dgraph-io/badger/v2"
 	"github.com/golang/protobuf/proto"
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"github.com/sirupsen/logrus"
 )
 

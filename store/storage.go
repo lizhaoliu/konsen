@@ -1,7 +1,7 @@
 package store
 
 import (
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	konsen "github.com/lizhaoliu/konsen/v2/proto"
 )
 
 // Storage provides an interface for a set of local persistent storage operations.

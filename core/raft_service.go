@@ -3,7 +3,7 @@ package core
 import (
 	"context"
 
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	konsen "github.com/lizhaoliu/konsen/v2/proto"
 )
 
 // RaftService defines methods exposed by a Raft service.

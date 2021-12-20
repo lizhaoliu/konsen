@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 )

@@ -3,7 +3,7 @@ package store
 import (
 	"github.com/boltdb/bolt"
 	"github.com/golang/protobuf/proto"
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"github.com/sirupsen/logrus"
 )
 

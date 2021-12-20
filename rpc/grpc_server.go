@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/lizhaoliu/konsen/v2/core"
-	konsen "github.com/lizhaoliu/konsen/v2/proto_gen"
+	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
@@ -14,6 +14,8 @@ import (
 const rpcTimeout = 10 * time.Second
 
 type RaftGRPCServer struct {
+	konsen.RaftServer
+
 	endpoint string
 	sm       *core.StateMachine
 	server   *grpc.Server
