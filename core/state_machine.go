@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/lizhaoliu/konsen/v2/datastore"
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
-	"github.com/lizhaoliu/konsen/v2/store"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -35,7 +35,7 @@ type StateMachine struct {
 	resetTimerCh chan struct{}    // Signals to reset election timer when AppendEntries or RequestVote requests/response are received.
 
 	// Persistent state storage on all servers.
-	storage store.Storage
+	storage datastore.Storage
 
 	// Volatile state on all servers.
 	commitIndex   uint64      // Index of highest log entry known to be committed (initialized to 0).
@@ -62,7 +62,7 @@ type StateMachine struct {
 
 // StateMachineConfig
 type StateMachineConfig struct {
-	Storage store.Storage          // Local storage instance.
+	Storage datastore.Storage      // Local storage instance.
 	Cluster *ClusterConfig         // Cluster configuration.
 	Clients map[string]RaftService // A map of "server name": "Raft service".
 }

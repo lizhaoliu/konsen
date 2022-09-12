@@ -1,4 +1,4 @@
-package store
+package datastore
 
 import (
 	"github.com/dgraph-io/badger/v2"

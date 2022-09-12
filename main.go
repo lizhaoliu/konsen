@@ -13,8 +13,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/lizhaoliu/konsen/v2/core"
+	"github.com/lizhaoliu/konsen/v2/datastore"
 	"github.com/lizhaoliu/konsen/v2/rpc"
-	"github.com/lizhaoliu/konsen/v2/store"
 	"github.com/lizhaoliu/konsen/v2/web/httpserver"
 	"github.com/sirupsen/logrus"
 )
@@ -72,7 +72,7 @@ func main() {
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		logrus.Fatalf("Failed to create dir: %v", err)
 	}
-	storage, err := store.NewBadger(store.BadgerConfig{
+	storage, err := datastore.NewBadger(datastore.BadgerConfig{
 		LogDir:   path.Join(dbDir, "logs"),
 		StateDir: path.Join(dbDir, "state"),
 	})

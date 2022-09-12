@@ -1,4 +1,4 @@
-package store
+package datastore
 
 import (
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
