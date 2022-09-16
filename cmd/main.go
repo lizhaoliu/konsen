@@ -4,6 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/lizhaoliu/konsen/v2/core"
+	"github.com/lizhaoliu/konsen/v2/datastore"
+	"github.com/lizhaoliu/konsen/v2/rpc"
+	"github.com/lizhaoliu/konsen/v2/web/httpserver"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -12,10 +16,6 @@ import (
 	"syscall"
 
 	"github.com/gin-gonic/gin"
-	"github.com/lizhaoliu/konsen/v2/core"
-	"github.com/lizhaoliu/konsen/v2/datastore"
-	"github.com/lizhaoliu/konsen/v2/rpc"
-	"github.com/lizhaoliu/konsen/v2/web/httpserver"
 	"github.com/sirupsen/logrus"
 )
 
