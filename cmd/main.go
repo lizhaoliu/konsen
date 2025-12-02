@@ -61,6 +61,14 @@ func createClients(cluster *core.ClusterConfig) (map[string]core.RaftService, er
 	return clients, nil
 }
 
+func closeClients(clients map[string]core.RaftService) {
+	for server, client := range clients {
+		if err := client.Close(); err != nil {
+			logrus.Errorf("Failed to close client for %s: %v", server, err)
+		}
+	}
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -129,7 +137,10 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
+	logrus.Info("Shutting down...")
 	sm.Close()
 	raftServer.Stop()
+	closeClients(clients)
 	storage.Close()
+	logrus.Info("Shutdown complete.")
 }

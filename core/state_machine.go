@@ -191,7 +191,7 @@ func (sm *StateMachine) setRole(role konsen.Role) {
 
 // AppendEntries puts the incoming AppendEntries request in main message channel and waits for result.
 func (sm *StateMachine) AppendEntries(ctx context.Context, req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
-	ch := make(chan *konsen.AppendEntriesResp)
+	ch := make(chan *konsen.AppendEntriesResp, 1) // Buffered to prevent blocking message loop if caller times out
 	sm.msgCh <- appendEntriesWrap{req: req, ch: ch}
 	select {
 	case <-ctx.Done():
@@ -203,7 +203,7 @@ func (sm *StateMachine) AppendEntries(ctx context.Context, req *konsen.AppendEnt
 
 // RequestVote puts the incoming RequestVote request in main message channel and waits for result.
 func (sm *StateMachine) RequestVote(ctx context.Context, req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
-	ch := make(chan *konsen.RequestVoteResp)
+	ch := make(chan *konsen.RequestVoteResp, 1) // Buffered to prevent blocking message loop if caller times out
 	sm.msgCh <- requestVoteWrap{req: req, ch: ch}
 	select {
 	case <-ctx.Done():
@@ -791,8 +791,10 @@ func (sm *StateMachine) startElectionLoop(ctx context.Context) {
 			timer := time.NewTimer(sm.nextTimeout())
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
 			case <-sm.stopCh:
+				timer.Stop()
 				return
 			case <-sm.resetTimerCh:
 				// Start the next round of timeout.
@@ -844,7 +846,7 @@ func (sm *StateMachine) nextTimeout() time.Duration {
 
 // AppendData stores the given data into state machine, and it returns after the data is replicated onto quorum.
 func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
-	ch := make(chan *konsen.AppendDataResp)
+	ch := make(chan *konsen.AppendDataResp, 1) // Buffered to prevent blocking message loop if caller times out
 	sm.msgCh <- appendDataMsg{req: req, ch: ch}
 
 	select {
@@ -942,6 +944,11 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
+
+		// Use NewTimer instead of time.After to allow proper cleanup
+		timer := time.NewTimer(defaultRequestTimeout)
+		defer timer.Stop()
+
 		select {
 		case <-condCh:
 			// Unregister via message to maintain actor pattern
@@ -951,7 +958,7 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 			}
 			log.Debugf("Log[%d] is committed and applied on local state machine.", logIndex)
 			ch <- &konsen.AppendDataResp{Success: true}
-		case <-time.After(defaultRequestTimeout):
+		case <-timer.C:
 			// Unregister via message to maintain actor pattern
 			select {
 			case sm.msgCh <- unregisterCondMsg{logIndex: logIndex}:
@@ -963,6 +970,11 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 				ErrorMessage: fmt.Sprintf("failed to replicate onto quorum and apply commands (are there more than %d nodes down?)", sm.getQuorum()),
 			}
 		case <-sm.stopCh:
+			// Unregister on shutdown as well
+			select {
+			case sm.msgCh <- unregisterCondMsg{logIndex: logIndex}:
+			default: // Non-blocking - msgCh might be closed or full during shutdown
+			}
 			ch <- &konsen.AppendDataResp{
 				Success:      false,
 				ErrorMessage: "server has been shut down",
@@ -972,7 +984,7 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 }
 
 func (sm *StateMachine) GetSnapshot(ctx context.Context) (*Snapshot, error) {
-	ch := make(chan *Snapshot)
+	ch := make(chan *Snapshot, 1) // Buffered to prevent blocking message loop if caller times out
 	sm.msgCh <- getSnapshotMsg{ch: ch}
 	select {
 	case <-ctx.Done():
@@ -1037,7 +1049,7 @@ func (sm *StateMachine) SetKeyValue(ctx context.Context, kv *konsen.KVList) erro
 }
 
 func (sm *StateMachine) GetValue(ctx context.Context, key []byte) ([]byte, error) {
-	ch := make(chan []byte)
+	ch := make(chan []byte, 1) // Buffered to prevent blocking message loop if caller times out
 	sm.msgCh <- getValueMsg{key: key, ch: ch}
 	select {
 	case <-ctx.Done():

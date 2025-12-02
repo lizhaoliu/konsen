@@ -16,4 +16,7 @@ type RaftService interface {
 
 	// AppendData sends AppendData request to the remote server.
 	AppendData(ctx context.Context, in *konsen.AppendDataReq) (*konsen.AppendDataResp, error)
+
+	// Close closes the connection to the remote server.
+	Close() error
 }
