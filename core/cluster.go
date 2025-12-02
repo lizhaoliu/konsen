@@ -2,9 +2,9 @@ package core
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 // ClusterConfig is the configuration of a cluster.
@@ -16,7 +16,7 @@ type ClusterConfig struct {
 
 // ParseClusterConfig parses given config YAML file.
 func ParseClusterConfig(cfgFilePath string) (*ClusterConfig, error) {
-	buf, err := ioutil.ReadFile(cfgFilePath)
+	buf, err := os.ReadFile(cfgFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cluster config file: %v", err)
 	}

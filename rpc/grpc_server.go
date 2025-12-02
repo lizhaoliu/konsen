@@ -14,7 +14,7 @@ import (
 const rpcTimeout = 10 * time.Second
 
 type RaftGRPCServer struct {
-	konsen.RaftServer
+	konsen.UnimplementedRaftServer
 
 	endpoint string
 	sm       *core.StateMachine

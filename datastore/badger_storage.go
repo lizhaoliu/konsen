@@ -1,10 +1,10 @@
 package datastore
 
 import (
-	"github.com/dgraph-io/badger/v2"
-	"github.com/golang/protobuf/proto"
+	"github.com/dgraph-io/badger/v4"
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 )
 
 type Badger struct {

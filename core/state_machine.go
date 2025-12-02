@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/lizhaoliu/konsen/v2/datastore"
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	log "github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -29,19 +30,20 @@ const (
 // Internal errors will always cause a crash on the server since otherwise the state machine may be left in an
 // inconsistent state.
 type StateMachine struct {
-	msgCh        chan interface{} // Main message queue.
-	stopCh       chan struct{}    // Signals to stop the state machine.
-	timerGateCh  chan struct{}    // Signals to run next round of election timeout countdown.
-	resetTimerCh chan struct{}    // Signals to reset election timer when AppendEntries or RequestVote requests/response are received.
+	msgCh           chan interface{} // Main message queue.
+	stopCh          chan struct{}    // Signals to stop the state machine.
+	timerGateCh     chan struct{}    // Signals to run next round of election timeout countdown.
+	resetTimerCh    chan struct{}    // Signals to reset election timer when AppendEntries or RequestVote requests/response are received.
+	stopHeartbeatCh chan struct{}    // Signals to stop the heartbeat loop when no longer leader.
 
 	// Persistent state storage on all servers.
 	storage datastore.Storage
 
 	// Volatile state on all servers.
-	commitIndex   uint64      // Index of highest log entry known to be committed (initialized to 0).
-	lastApplied   uint64      // Index of highest log entry applied to state machine (initialized to 0).
-	role          konsen.Role // Current role.
-	currentLeader string      // Current leader.
+	commitIndex   uint64       // Index of highest log entry known to be committed (initialized to 0).
+	lastApplied   uint64       // Index of highest log entry applied to state machine (initialized to 0).
+	role          atomic.Int32 // Current role (atomic for safe reads from heartbeat goroutine).
+	currentLeader string       // Current leader.
 
 	// Volatile state on candidates.
 	numVotes int
@@ -57,7 +59,10 @@ type StateMachine struct {
 	wg   sync.WaitGroup
 	once sync.Once
 
-	condMap sync.Map
+	// condMap stores channels for goroutines waiting on specific log indices to be applied.
+	// Key: log index (uint64), Value: chan struct{}
+	// Managed via message passing through registerCondMsg and unregisterCondMsg.
+	condMap map[uint64]chan struct{}
 }
 
 // StateMachineConfig
@@ -124,6 +129,17 @@ type getValueMsg struct {
 	ch  chan<- []byte
 }
 
+// registerCondMsg represents a message to register a condition channel for a log index.
+type registerCondMsg struct {
+	logIndex uint64
+	condCh   chan struct{}
+}
+
+// unregisterCondMsg represents a message to unregister a condition channel for a log index.
+type unregisterCondMsg struct {
+	logIndex uint64
+}
+
 // NewStateMachine creates a new instance of the state machine.
 func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 	if len(config.Cluster.Servers)%2 != 1 {
@@ -131,10 +147,11 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 	}
 
 	sm := &StateMachine{
-		msgCh:        make(chan interface{}),
-		stopCh:       make(chan struct{}),
-		timerGateCh:  make(chan struct{}, 1),
-		resetTimerCh: make(chan struct{}),
+		msgCh:           make(chan interface{}),
+		stopCh:          make(chan struct{}),
+		timerGateCh:     make(chan struct{}, 1),
+		resetTimerCh:    make(chan struct{}, 1), // Buffered to prevent blocking message loop
+		stopHeartbeatCh: nil,                    // Created when becoming leader
 
 		storage: config.Storage,
 		cluster: config.Cluster,
@@ -142,11 +159,13 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 
 		commitIndex: 0,
 		lastApplied: 0,
-		role:        konsen.Role_FOLLOWER,
 
 		nextIndex:  make(map[string]uint64),
 		matchIndex: make(map[string]uint64),
+
+		condMap: make(map[uint64]chan struct{}),
 	}
+	sm.setRole(konsen.Role_FOLLOWER)
 
 	return sm, nil
 }
@@ -158,6 +177,16 @@ func (sm *StateMachine) Run(ctx context.Context) {
 		sm.startElectionLoop(ctx)
 		sm.wg.Wait()
 	})
+}
+
+// getRole returns the current role (thread-safe).
+func (sm *StateMachine) getRole() konsen.Role {
+	return konsen.Role(sm.role.Load())
+}
+
+// setRole sets the current role (thread-safe).
+func (sm *StateMachine) setRole(role konsen.Role) {
+	sm.role.Store(int32(role))
 }
 
 // AppendEntries puts the incoming AppendEntries request in main message channel and waits for result.
@@ -189,7 +218,7 @@ func (sm *StateMachine) grantVote(term uint64, candidateID string) (*konsen.Requ
 	if err := sm.storage.SetVotedFor(candidateID); err != nil {
 		return nil, err
 	}
-	log.Debug("Granted vote for candidate %q for term %d", candidateID, term)
+	log.Debugf("Granted vote for candidate %q for term %d", candidateID, term)
 	return &konsen.RequestVoteResp{Term: term, VoteGranted: true}, nil
 }
 
@@ -206,7 +235,8 @@ func (sm *StateMachine) maybeBecomeFollower(term uint64) (uint64, error) {
 			return 0, fmt.Errorf("failed to set current term to %d: %v", term, err)
 		}
 		currentTerm = term
-		sm.role = konsen.Role_FOLLOWER
+		sm.stopHeartbeatIfRunning()
+		sm.setRole(konsen.Role_FOLLOWER)
 		if err := sm.storage.SetVotedFor(""); err != nil {
 			return currentTerm, fmt.Errorf("failed to reset voted for: %v", err)
 		}
@@ -214,9 +244,22 @@ func (sm *StateMachine) maybeBecomeFollower(term uint64) (uint64, error) {
 	return currentTerm, nil
 }
 
+// stopHeartbeatIfRunning stops the heartbeat loop if it's running.
+func (sm *StateMachine) stopHeartbeatIfRunning() {
+	if sm.stopHeartbeatCh != nil {
+		close(sm.stopHeartbeatCh)
+		sm.stopHeartbeatCh = nil
+	}
+}
+
 // resetElectionTimer signals the election timer to start a new round of election timeout countdown.
+// Uses non-blocking send since the channel is buffered - if a reset is already pending, we don't need another.
 func (sm *StateMachine) resetElectionTimer() {
-	sm.resetTimerCh <- struct{}{}
+	select {
+	case sm.resetTimerCh <- struct{}{}:
+	default:
+		// Reset already pending, no need to send another
+	}
 }
 
 // openElectionTimerGate signals the election timer that it can start countdown.
@@ -249,7 +292,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 		return nil, fmt.Errorf("failed to get log at index %d: %v", req.GetPrevLogIndex(), err)
 	}
 	if prevLogTerm != req.GetPrevLogTerm() {
-		log.Debug("Local prevLogTerm(%d) mismatches request prevLogTerm(%d).", prevLogTerm, req.GetPrevLogTerm())
+		log.Debugf("Local prevLogTerm(%d) mismatches request prevLogTerm(%d).", prevLogTerm, req.GetPrevLogTerm())
 		return &konsen.AppendEntriesResp{Term: currentTerm, Success: false}, nil
 	}
 
@@ -268,7 +311,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 				break
 			}
 			if localLog.GetTerm() != newLog.GetTerm() {
-				log.Debug("Local logs conflict from index %d, now delete onwards.", newLog.GetIndex())
+				log.Debugf("Local logs conflict from index %d, now delete onwards.", newLog.GetIndex())
 				if err := sm.storage.DeleteLogsFrom(newLog.GetIndex()); err != nil {
 					return nil, fmt.Errorf("failed to delete logs from min index %d: %v", newLog.GetIndex(), err)
 				}
@@ -278,7 +321,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 		}
 
 		// 4. Append any new entries not already in the log.
-		log.Debug("Append logs from index %d.", entries[startIdx].GetIndex())
+		log.Debugf("Append logs from index %d.", entries[startIdx].GetIndex())
 		if err := sm.storage.WriteLogs(entries[startIdx:]); err != nil {
 			return nil, fmt.Errorf("failed to write logs: %v", err)
 		}
@@ -315,7 +358,7 @@ func (sm *StateMachine) handleAppendEntriesResp(
 	}
 
 	// Terminate if no longer a leader.
-	if sm.role != konsen.Role_LEADER {
+	if sm.getRole() != konsen.Role_LEADER {
 		return nil
 	}
 
@@ -433,7 +476,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 		return fmt.Errorf("%v", err)
 	}
 
-	if sm.role != konsen.Role_CANDIDATE {
+	if sm.getRole() != konsen.Role_CANDIDATE {
 		return nil
 	}
 
@@ -453,7 +496,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 // becomeLeader modifies internal state to become a leader, and starts the worker that periodically sends heartbeat.
 func (sm *StateMachine) becomeLeader(term uint64) error {
 	log.Infof("Term - %d, leader - %q.", term, sm.cluster.LocalServerName)
-	sm.role = konsen.Role_LEADER
+	sm.setRole(konsen.Role_LEADER)
 	sm.currentLeader = sm.cluster.LocalServerName
 	lastLogIndex, err := sm.storage.LastLogIndex()
 	if err != nil {
@@ -468,6 +511,8 @@ func (sm *StateMachine) becomeLeader(term uint64) error {
 		}
 	}
 
+	// Create a new stop channel for the heartbeat loop.
+	sm.stopHeartbeatCh = make(chan struct{})
 	sm.startHeartbeatLoop(context.Background())
 
 	return nil
@@ -501,7 +546,8 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 				defer sm.wg.Done()
 				resp, err := sm.clients[server].RequestVote(ctx, req)
 				if err != nil {
-					log.Debug("Failed to send RequestVote to %q(%q): %v", server, sm.cluster.Servers[server], err)
+					log.Debugf("Failed to send RequestVote to %q(%q): %v", server, sm.cluster.Servers[server], err)
+					return // Don't send nil response to message loop
 				}
 				select {
 				case sm.msgCh <- resp:
@@ -515,7 +561,7 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 
 // sendAppendEntries constructs a AppendEntries request and sends it to all nodes in the cluster.
 func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
-	if sm.role != konsen.Role_LEADER {
+	if sm.getRole() != konsen.Role_LEADER {
 		return nil
 	}
 
@@ -550,7 +596,7 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 				defer sm.wg.Done()
 				resp, err := sm.clients[server].AppendEntries(ctx, req)
 				if err != nil {
-					log.Debug("Failed to send AppendEntries to %q(%q): %v", server, sm.cluster.Servers[server], err)
+					log.Debugf("Failed to send AppendEntries to %q(%q): %v", server, sm.cluster.Servers[server], err)
 					return
 				}
 				select {
@@ -571,7 +617,8 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 // handleElectionTimeout handles when the election timeout event triggers.
 func (sm *StateMachine) handleElectionTimeout() error {
 	// If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate.
-	sm.role = konsen.Role_CANDIDATE
+	sm.stopHeartbeatIfRunning()
+	sm.setRole(konsen.Role_CANDIDATE)
 	sm.numVotes = 0
 	sm.currentLeader = ""
 
@@ -581,7 +628,7 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	if err != nil {
 		return fmt.Errorf("failed to get current term: %v", err)
 	}
-	log.Debug("Term - %d: election timeout", currentTerm)
+	log.Debugf("Term - %d: election timeout", currentTerm)
 	currentTerm++
 	if err := sm.storage.SetCurrentTerm(currentTerm); err != nil {
 		return fmt.Errorf("failed to set current term to %d: %v", currentTerm, err)
@@ -597,7 +644,7 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	sm.timerGateCh <- struct{}{}
 
 	// 4. Send RequestVote RPCs to all other servers.
-	log.Debug("Send RequestVote for term %d.", currentTerm)
+	log.Debugf("Send RequestVote for term %d.", currentTerm)
 	if err := sm.sendVoteRequests(context.Background()); err != nil {
 		return fmt.Errorf("failed to send vote requests: %v", err)
 	}
@@ -615,6 +662,7 @@ func (sm *StateMachine) handleElectionTimeout() error {
 }
 
 // maybeApplyLogs applies logs that are not yet.
+// This method is called from the message loop, so we can directly access condMap.
 func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) error {
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
 	for sm.commitIndex > sm.lastApplied {
@@ -627,12 +675,11 @@ func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) 
 			return fmt.Errorf("failed to apply command from log at index %d", sm.lastApplied)
 		}
 		// Notifies if there is a goroutine waiting on log[lastApplied] being applied.
-		condCh, ok := sm.condMap.Load(sm.lastApplied)
-		if ok {
-			condCh := condCh.(chan struct{})
+		if condCh, ok := sm.condMap[sm.lastApplied]; ok {
 			close(condCh)
+			// Note: deletion is handled by unregisterCondMsg from the waiting goroutine
 		}
-		log.Debug("Applied log at index %d", sm.lastApplied)
+		log.Debugf("Applied log at index %d", sm.lastApplied)
 	}
 	return nil
 }
@@ -718,6 +765,10 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 						log.Fatalf("%v", err)
 					}
 					v.ch <- val
+				case registerCondMsg:
+					sm.condMap[v.logIndex] = v.condCh
+				case unregisterCondMsg:
+					delete(sm.condMap, v.logIndex)
 				default:
 					log.Fatalf("Unrecognized message: %v", v)
 				}
@@ -757,6 +808,7 @@ func (sm *StateMachine) startElectionLoop(ctx context.Context) {
 
 // startHeartbeatLoop starts the heartbeat loop.
 func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
+	stopCh := sm.stopHeartbeatCh // Capture the stop channel to avoid race
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
@@ -770,9 +822,12 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
 				return
 			case <-sm.stopCh:
 				return
+			case <-stopCh:
+				// No longer leader, stop heartbeat loop
+				return
 			case <-ticker.C:
-				// TODO: role is read by another goroutine, there might be data race.
-				if sm.role != konsen.Role_LEADER {
+				// Use atomic read to check role - safe for concurrent access
+				if sm.getRole() != konsen.Role_LEADER {
 					return
 				}
 				sm.msgCh <- appendEntriesMsg{}
@@ -821,9 +876,10 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 	}
 
 	// Only leader writes data to its logs.
-	if sm.role != konsen.Role_LEADER {
+	if sm.getRole() != konsen.Role_LEADER {
 		// Forward the request to leader.
-		sm.forwardRequestToLeader(req, ch)
+		// Capture currentLeader before spawning goroutine to avoid data race.
+		sm.forwardRequestToLeader(sm.currentLeader, req, ch)
 		return nil
 	}
 
@@ -855,19 +911,20 @@ func (sm *StateMachine) writeToLogs(data []byte) (*konsen.Log, error) {
 	if err := sm.storage.WriteLog(newLog); err != nil {
 		return nil, fmt.Errorf("failed to write log: %v", err)
 	}
-	log.Debug("Log written: index - %d, term - %d, bytes - %d.", newLog.GetIndex(), newLog.GetTerm(), len(newLog.GetData()))
+	log.Debugf("Log written: index - %d, term - %d, bytes - %d.", newLog.GetIndex(), newLog.GetTerm(), len(newLog.GetData()))
 	return newLog, nil
 }
 
 // forwardRequestToLeader starts a new goroutine to send request to current leader, and the goroutine replies after receiving result from leader.
-func (sm *StateMachine) forwardRequestToLeader(req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) {
+// The leader parameter is captured before spawning the goroutine to avoid data race on sm.currentLeader.
+func (sm *StateMachine) forwardRequestToLeader(leader string, req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) {
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
 		ctx := context.Background()
-		resp, err := sm.clients[sm.currentLeader].AppendData(ctx, req)
+		resp, err := sm.clients[leader].AppendData(ctx, req)
 		if err != nil {
-			log.Debug("Failed to send AppendDataReq to leader %q: %v", sm.currentLeader, err)
+			log.Debugf("Failed to send AppendDataReq to leader %q: %v", leader, err)
 			ch <- &konsen.AppendDataResp{Success: false, ErrorMessage: err.Error()}
 			return
 		}
@@ -876,22 +933,39 @@ func (sm *StateMachine) forwardRequestToLeader(req *konsen.AppendDataReq, ch cha
 }
 
 // replyWhenLogApplied starts a new goroutine to reply request after new log is applied to local state machine.
+// This method is called from the message loop, so we can directly access condMap.
 func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.AppendDataResp) {
 	condCh := make(chan struct{})
-	sm.condMap.Store(logIndex, condCh)
+	// Register the condition channel directly - we're in the message loop
+	sm.condMap[logIndex] = condCh
+
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
 		select {
 		case <-condCh:
-			sm.condMap.Delete(logIndex)
-			log.Debug("Log[%d] is committed and applied on local state machine.", logIndex)
+			// Unregister via message to maintain actor pattern
+			select {
+			case sm.msgCh <- unregisterCondMsg{logIndex: logIndex}:
+			case <-sm.stopCh:
+			}
+			log.Debugf("Log[%d] is committed and applied on local state machine.", logIndex)
 			ch <- &konsen.AppendDataResp{Success: true}
 		case <-time.After(defaultRequestTimeout):
-			log.Debug("Timeout while waiting for log[%d] to be committed and applied.", logIndex)
+			// Unregister via message to maintain actor pattern
+			select {
+			case sm.msgCh <- unregisterCondMsg{logIndex: logIndex}:
+			case <-sm.stopCh:
+			}
+			log.Debugf("Timeout while waiting for log[%d] to be committed and applied.", logIndex)
 			ch <- &konsen.AppendDataResp{
 				Success:      false,
 				ErrorMessage: fmt.Sprintf("failed to replicate onto quorum and apply commands (are there more than %d nodes down?)", sm.getQuorum()),
+			}
+		case <-sm.stopCh:
+			ch <- &konsen.AppendDataResp{
+				Success:      false,
+				ErrorMessage: "server has been shut down",
 			}
 		}
 	}()
@@ -937,7 +1011,7 @@ func (sm *StateMachine) handleGetSnapshot() (*Snapshot, error) {
 		CurrentTerm:   currentTerm,
 		CommitIndex:   sm.commitIndex,
 		LastApplied:   sm.lastApplied,
-		Role:          sm.role,
+		Role:          sm.getRole(),
 		CurrentLeader: sm.currentLeader,
 		NextIndex:     nextIndexMap,
 		MatchIndex:    matchIndexMap,
@@ -978,6 +1052,7 @@ func (sm *StateMachine) handleGetValue(key []byte) ([]byte, error) {
 }
 
 func (sm *StateMachine) Close() error {
+	sm.stopHeartbeatIfRunning()
 	close(sm.stopCh)
 	sm.wg.Wait()
 	return nil

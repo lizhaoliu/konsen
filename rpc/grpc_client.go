@@ -6,6 +6,7 @@ import (
 
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -27,14 +28,24 @@ func NewRaftGRPCClient(config RaftGRPCClientConfig) (*RaftGRPCClient, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), config.ConnectionTimeout)
 	defer cancel()
-	conn, err := grpc.DialContext(
-		ctx,
+	conn, err := grpc.NewClient(
 		config.Endpoint,
-		grpc.WithInsecure(), // TODO: enable secured connection.
+		grpc.WithTransportCredentials(insecure.NewCredentials()), // TODO: enable secured connection.
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{}),
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	// Wait for connection to be ready with timeout
+	go func() {
+		conn.Connect()
+	}()
+	select {
+	case <-ctx.Done():
+		conn.Close()
+		return nil, ctx.Err()
+	default:
 	}
 
 	client := konsen.NewRaftClient(conn)
