@@ -1,6 +1,8 @@
 package datastore
 
 import (
+	"errors"
+
 	"github.com/dgraph-io/badger/v4"
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"github.com/sirupsen/logrus"
@@ -27,6 +29,7 @@ func NewBadger(config BadgerConfig) (*Badger, error) {
 	logrus.Infof("Badger state DB file set to: %s", config.StateDir)
 	stateDB, err := badger.Open(badger.DefaultOptions(config.StateDir))
 	if err != nil {
+		logDB.Close()
 		return nil, err
 	}
 
@@ -47,7 +50,7 @@ func (b *Badger) GetCurrentTerm() (uint64, error) {
 			term = bytesToUint64(val)
 			return nil
 		})
-	}); err != nil && err != badger.ErrKeyNotFound {
+	}); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
 		return 0, err
 	}
 	return term, nil
@@ -70,7 +73,7 @@ func (b *Badger) GetVotedFor() (string, error) {
 			votedFor = string(val)
 			return nil
 		})
-	}); err != nil && err != badger.ErrKeyNotFound {
+	}); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
 		return "", err
 	}
 	return votedFor, nil
@@ -78,6 +81,15 @@ func (b *Badger) GetVotedFor() (string, error) {
 
 func (b *Badger) SetVotedFor(candidateID string) error {
 	return b.stateDB.Update(func(txn *badger.Txn) error {
+		return txn.Set(votedForKey, []byte(candidateID))
+	})
+}
+
+func (b *Badger) SetTermAndVotedFor(term uint64, candidateID string) error {
+	return b.stateDB.Update(func(txn *badger.Txn) error {
+		if err := txn.Set(currentTermKey, uint64ToBytes(term)); err != nil {
+			return err
+		}
 		return txn.Set(votedForKey, []byte(candidateID))
 	})
 }
@@ -93,7 +105,7 @@ func (b *Badger) GetLog(logIndex uint64) (*konsen.Log, error) {
 		return item.Value(func(val []byte) error {
 			return proto.Unmarshal(val, log)
 		})
-	}); err != nil && err != badger.ErrKeyNotFound {
+	}); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
 		return nil, err
 	}
 	return log, nil
@@ -218,21 +230,40 @@ func (b *Badger) DeleteLogsFrom(minLogIndex uint64) error {
 }
 
 func (b *Badger) SetValue(key []byte, value []byte) error {
-	panic("implement me")
+	return b.stateDB.Update(func(txn *badger.Txn) error {
+		// Use "kv:" prefix to distinguish from other state keys
+		prefixedKey := make([]byte, 0, 3+len(key))
+		prefixedKey = append(prefixedKey, "kv:"...)
+		prefixedKey = append(prefixedKey, key...)
+		return txn.Set(prefixedKey, value)
+	})
 }
 
 func (b *Badger) GetValue(key []byte) ([]byte, error) {
-	panic("implement me")
+	var value []byte
+	if err := b.stateDB.View(func(txn *badger.Txn) error {
+		// Use "kv:" prefix to distinguish from other state keys
+		prefixedKey := make([]byte, 0, 3+len(key))
+		prefixedKey = append(prefixedKey, "kv:"...)
+		prefixedKey = append(prefixedKey, key...)
+		item, err := txn.Get(prefixedKey)
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			value = make([]byte, len(val))
+			copy(value, val)
+			return nil
+		})
+	}); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+		return nil, err
+	}
+	return value, nil
 }
 
 func (b *Badger) Close() error {
 	stateDBErr := b.stateDB.Close()
 	logDBErr := b.logDB.Close()
-	if stateDBErr != nil {
-		return stateDBErr
-	}
-	if logDBErr != nil {
-		return logDBErr
-	}
-	return nil
+	// Use errors.Join to combine both errors (returns nil if both are nil)
+	return errors.Join(stateDBErr, logDBErr)
 }

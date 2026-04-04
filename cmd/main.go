@@ -4,18 +4,19 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/lizhaoliu/konsen/v2/core"
-	"github.com/lizhaoliu/konsen/v2/datastore"
-	"github.com/lizhaoliu/konsen/v2/rpc"
-	"github.com/lizhaoliu/konsen/v2/web/httpserver"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path"
 	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/lizhaoliu/konsen/v2/core"
+	"github.com/lizhaoliu/konsen/v2/datastore"
+	"github.com/lizhaoliu/konsen/v2/rpc"
+	"github.com/lizhaoliu/konsen/v2/web/httpserver"
 	"github.com/sirupsen/logrus"
 )
 
@@ -127,9 +128,9 @@ func main() {
 		}
 	}()
 
-	// Starts pprof server.
+	// Starts pprof server on localhost only (not exposed externally).
 	go func() {
-		if err := http.ListenAndServe(":6060", nil); err != nil {
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
 			logrus.Errorf("Failed to start pprof server: %v", err)
 		}
 	}()
@@ -138,6 +139,14 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	logrus.Info("Shutting down...")
+
+	// Gracefully shutdown HTTP server with timeout
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		logrus.Errorf("HTTP server shutdown error: %v", err)
+	}
+
 	sm.Close()
 	raftServer.Stop()
 	closeClients(clients)

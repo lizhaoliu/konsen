@@ -32,8 +32,7 @@ const (
 type StateMachine struct {
 	msgCh           chan interface{} // Main message queue.
 	stopCh          chan struct{}    // Signals to stop the state machine.
-	timerGateCh     chan struct{}    // Signals to run next round of election timeout countdown.
-	resetTimerCh    chan struct{}    // Signals to reset election timer when AppendEntries or RequestVote requests/response are received.
+	resetTimerCh    chan struct{}    // Signals to reset election timer when valid AppendEntries or vote grant occurs.
 	stopHeartbeatCh chan struct{}    // Signals to stop the heartbeat loop when no longer leader.
 
 	// Persistent state storage on all servers.
@@ -149,7 +148,6 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 	sm := &StateMachine{
 		msgCh:           make(chan interface{}),
 		stopCh:          make(chan struct{}),
-		timerGateCh:     make(chan struct{}, 1),
 		resetTimerCh:    make(chan struct{}, 1), // Buffered to prevent blocking message loop
 		stopHeartbeatCh: nil,                    // Created when becoming leader
 
@@ -218,6 +216,8 @@ func (sm *StateMachine) grantVote(term uint64, candidateID string) (*konsen.Requ
 	if err := sm.storage.SetVotedFor(candidateID); err != nil {
 		return nil, err
 	}
+	// Only reset election timer when granting a vote (per Raft paper Section 5.2).
+	sm.resetElectionTimer()
 	log.Debugf("Granted vote for candidate %q for term %d", candidateID, term)
 	return &konsen.RequestVoteResp{Term: term, VoteGranted: true}, nil
 }
@@ -231,15 +231,13 @@ func (sm *StateMachine) maybeBecomeFollower(term uint64) (uint64, error) {
 	}
 	// If given term is greater than current term, update current term and become a follower.
 	if term > currentTerm {
-		if err := sm.storage.SetCurrentTerm(term); err != nil {
-			return 0, fmt.Errorf("failed to set current term to %d: %v", term, err)
+		// Atomically persist term and votedFor to prevent split-brain after crash.
+		if err := sm.storage.SetTermAndVotedFor(term, ""); err != nil {
+			return 0, fmt.Errorf("failed to set term to %d and reset votedFor: %v", term, err)
 		}
 		currentTerm = term
 		sm.stopHeartbeatIfRunning()
 		sm.setRole(konsen.Role_FOLLOWER)
-		if err := sm.storage.SetVotedFor(""); err != nil {
-			return currentTerm, fmt.Errorf("failed to reset voted for: %v", err)
-		}
 	}
 	return currentTerm, nil
 }
@@ -262,16 +260,8 @@ func (sm *StateMachine) resetElectionTimer() {
 	}
 }
 
-// openElectionTimerGate signals the election timer that it can start countdown.
-func (sm *StateMachine) openElectionTimerGate() {
-	sm.timerGateCh <- struct{}{}
-}
-
 // handleAppendEntries handles a AppendEntries request.
 func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
-	sm.resetElectionTimer()
-	defer sm.openElectionTimerGate()
-
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(req.GetTerm())
 	if err != nil {
@@ -284,6 +274,8 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 	}
 
 	// At this point, the request is coming from a legit leader, and request term == currentTerm.
+	// Only reset election timer for valid AppendEntries from current leader (per Raft paper Section 5.2).
+	sm.resetElectionTimer()
 	sm.currentLeader = req.GetLeaderId()
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
@@ -300,17 +292,20 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 	// If there are new logs to append.
 	if len(entries) > 0 {
 		// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it.
-		startIdx := 0
+		// 4. Append any new entries not already in the log.
+		startIdx := len(entries) // Initialize to end (no entries to write by default)
 		for i, newLog := range entries {
 			localLog, err := sm.storage.GetLog(newLog.GetIndex())
 			if err != nil {
 				return nil, fmt.Errorf("failed to get log at index %d: %v", newLog.GetIndex(), err)
 			}
 			if localLog == nil {
+				// Entry doesn't exist, need to write from here
 				startIdx = i
 				break
 			}
 			if localLog.GetTerm() != newLog.GetTerm() {
+				// Conflict: delete existing entries and write from here
 				log.Debugf("Local logs conflict from index %d, now delete onwards.", newLog.GetIndex())
 				if err := sm.storage.DeleteLogsFrom(newLog.GetIndex()); err != nil {
 					return nil, fmt.Errorf("failed to delete logs from min index %d: %v", newLog.GetIndex(), err)
@@ -318,12 +313,15 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 				startIdx = i
 				break
 			}
+			// Entry exists with matching term - skip it
 		}
 
-		// 4. Append any new entries not already in the log.
-		log.Debugf("Append logs from index %d.", entries[startIdx].GetIndex())
-		if err := sm.storage.WriteLogs(entries[startIdx:]); err != nil {
-			return nil, fmt.Errorf("failed to write logs: %v", err)
+		// Only write if there are new entries to append
+		if startIdx < len(entries) {
+			log.Debugf("Append logs from index %d.", entries[startIdx].GetIndex())
+			if err := sm.storage.WriteLogs(entries[startIdx:]); err != nil {
+				return nil, fmt.Errorf("failed to write logs: %v", err)
+			}
 		}
 	}
 
@@ -348,9 +346,6 @@ func (sm *StateMachine) handleAppendEntriesResp(
 	resp *konsen.AppendEntriesResp,
 	req *konsen.AppendEntriesReq,
 	server string) error {
-	sm.resetElectionTimer()
-	defer sm.openElectionTimerGate()
-
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(resp.GetTerm())
 	if err != nil {
@@ -389,7 +384,10 @@ func (sm *StateMachine) handleAppendEntriesResp(
 		}
 	} else {
 		// AppendEntries fails because of log inconsistency: decrement nextIndex and retry.
-		sm.nextIndex[server]--
+		// Guard against underflow: nextIndex must stay >= 1 (log indices start at 1).
+		if sm.nextIndex[server] > 1 {
+			sm.nextIndex[server]--
+		}
 	}
 
 	return nil
@@ -408,9 +406,6 @@ func (sm *StateMachine) isLogOnMajority(logIndex uint64) bool {
 
 // handleRequestVote handles a RequestVote request.
 func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
-	sm.resetElectionTimer()
-	defer sm.openElectionTimerGate()
-
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(req.GetTerm())
 	if err != nil {
@@ -467,9 +462,6 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq) (*konsen.R
 
 // handleRequestVoteResp handles a RequestVote response.
 func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) error {
-	sm.resetElectionTimer()
-	defer sm.openElectionTimerGate()
-
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
 	currentTerm, err := sm.maybeBecomeFollower(resp.GetTerm())
 	if err != nil {
@@ -544,7 +536,9 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 			server := server
 			go func() {
 				defer sm.wg.Done()
-				resp, err := sm.clients[server].RequestVote(ctx, req)
+				rpcCtx, cancel := context.WithTimeout(ctx, defaultRequestTimeout)
+				defer cancel()
+				resp, err := sm.clients[server].RequestVote(rpcCtx, req)
 				if err != nil {
 					log.Debugf("Failed to send RequestVote to %q(%q): %v", server, sm.cluster.Servers[server], err)
 					return // Don't send nil response to message loop
@@ -594,7 +588,9 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 			server := server
 			go func() {
 				defer sm.wg.Done()
-				resp, err := sm.clients[server].AppendEntries(ctx, req)
+				rpcCtx, cancel := context.WithTimeout(ctx, defaultRequestTimeout)
+				defer cancel()
+				resp, err := sm.clients[server].AppendEntries(rpcCtx, req)
 				if err != nil {
 					log.Debugf("Failed to send AppendEntries to %q(%q): %v", server, sm.cluster.Servers[server], err)
 					return
@@ -623,25 +619,17 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	sm.currentLeader = ""
 
 	// On conversion to candidate, start election:
-	// 1. Increment currentTerm.
+	// 1. Increment currentTerm and 2. Vote for self (atomically persisted).
 	currentTerm, err := sm.storage.GetCurrentTerm()
 	if err != nil {
 		return fmt.Errorf("failed to get current term: %v", err)
 	}
 	log.Debugf("Term - %d: election timeout", currentTerm)
 	currentTerm++
-	if err := sm.storage.SetCurrentTerm(currentTerm); err != nil {
-		return fmt.Errorf("failed to set current term to %d: %v", currentTerm, err)
-	}
-
-	// 2. Vote for self.
-	if err := sm.storage.SetVotedFor(sm.cluster.LocalServerName); err != nil {
-		return fmt.Errorf("failed to set votedFor: %v", err)
+	if err := sm.storage.SetTermAndVotedFor(currentTerm, sm.cluster.LocalServerName); err != nil {
+		return fmt.Errorf("failed to set term to %d and vote for self: %v", currentTerm, err)
 	}
 	sm.numVotes++
-
-	// 3. Reset election timer.
-	sm.timerGateCh <- struct{}{}
 
 	// 4. Send RequestVote RPCs to all other servers.
 	log.Debugf("Send RequestVote for term %d.", currentTerm)
@@ -779,15 +767,11 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 
 // startElectionLoop starts the election timeout monitoring loop.
 func (sm *StateMachine) startElectionLoop(ctx context.Context) {
-	sm.timerGateCh <- struct{}{}
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
 
 		for {
-			// Waits for gate signal to start a new round of election timeout countdown.
-			<-sm.timerGateCh
-
 			timer := time.NewTimer(sm.nextTimeout())
 			select {
 			case <-ctx.Done():
@@ -797,12 +781,20 @@ func (sm *StateMachine) startElectionLoop(ctx context.Context) {
 				timer.Stop()
 				return
 			case <-sm.resetTimerCh:
-				// Start the next round of timeout.
 				timer.Stop()
 				continue
 			case <-timer.C:
-				// Election timeout occurs.
-				sm.msgCh <- electionTimeoutMsg{}
+				// Election timeout fired. Try to send, but allow cancellation
+				// by a concurrent reset to avoid spurious elections.
+				select {
+				case sm.msgCh <- electionTimeoutMsg{}:
+				case <-sm.resetTimerCh:
+					continue
+				case <-sm.stopCh:
+					return
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
@@ -923,7 +915,8 @@ func (sm *StateMachine) forwardRequestToLeader(leader string, req *konsen.Append
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+		defer cancel()
 		resp, err := sm.clients[leader].AppendData(ctx, req)
 		if err != nil {
 			log.Debugf("Failed to send AppendDataReq to leader %q: %v", leader, err)
@@ -1064,7 +1057,8 @@ func (sm *StateMachine) handleGetValue(key []byte) ([]byte, error) {
 }
 
 func (sm *StateMachine) Close() error {
-	sm.stopHeartbeatIfRunning()
+	// Closing stopCh signals all goroutines (message loop, election loop, heartbeat loop) to exit.
+	// No need to call stopHeartbeatIfRunning() here — avoids data race with message loop.
 	close(sm.stopCh)
 	sm.wg.Wait()
 	return nil

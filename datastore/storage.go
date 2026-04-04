@@ -18,6 +18,10 @@ type Storage interface {
 	// SetVotedFor sets the candidate ID that received a vote in current term.
 	SetVotedFor(candidateID string) error
 
+	// SetTermAndVotedFor atomically sets the current term and votedFor.
+	// This is required by Raft to prevent split-brain after a crash between separate SetCurrentTerm and SetVotedFor calls.
+	SetTermAndVotedFor(term uint64, candidateID string) error
+
 	// GetLog returns the log entry on given index.
 	GetLog(logIndex uint64) (*konsen.Log, error)
 

@@ -52,15 +52,16 @@ func (s *Server) initialize() {
 
 func (s *Server) getHandler(c *gin.Context) {
 	key := c.Query("key")
-	if key != "" {
-		ctx := context.Background()
-		buf, err := s.sm.GetValue(ctx, []byte(key))
-		if err != nil {
-			c.String(http.StatusInternalServerError, err.Error())
-			return
-		}
-		c.String(http.StatusOK, string(buf))
+	if key == "" {
+		c.String(http.StatusBadRequest, "missing required query parameter: key")
+		return
 	}
+	buf, err := s.sm.GetValue(c.Request.Context(), []byte(key))
+	if err != nil {
+		c.String(http.StatusInternalServerError, err.Error())
+		return
+	}
+	c.String(http.StatusOK, string(buf))
 }
 
 func (s *Server) postHandler(c *gin.Context) {
@@ -78,8 +79,7 @@ func (s *Server) postHandler(c *gin.Context) {
 		}
 	}
 	kvList := &konsen.KVList{KvList: kvs}
-	ctx := context.Background()
-	if err := s.sm.SetKeyValue(ctx, kvList); err != nil {
+	if err := s.sm.SetKeyValue(c.Request.Context(), kvList); err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -87,5 +87,13 @@ func (s *Server) postHandler(c *gin.Context) {
 }
 
 func (s *Server) Run() error {
-	return s.httpServer.ListenAndServe()
+	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+// Shutdown gracefully shuts down the server, allowing in-flight requests to complete.
+func (s *Server) Shutdown(ctx context.Context) error {
+	return s.httpServer.Shutdown(ctx)
 }

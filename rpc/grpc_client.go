@@ -2,7 +2,6 @@ package rpc
 
 import (
 	"context"
-	"time"
 
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"google.golang.org/grpc"
@@ -10,24 +9,19 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
-const defaultConnectionTimeout = 30 * time.Second
-
 type RaftGRPCClient struct {
 	conn   *grpc.ClientConn
 	client konsen.RaftClient
 }
 
 type RaftGRPCClientConfig struct {
-	Endpoint          string
-	ConnectionTimeout time.Duration
+	Endpoint string
 }
 
 func NewRaftGRPCClient(config RaftGRPCClientConfig) (*RaftGRPCClient, error) {
-	if config.ConnectionTimeout == 0 {
-		config.ConnectionTimeout = defaultConnectionTimeout
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), config.ConnectionTimeout)
-	defer cancel()
+	// grpc.NewClient creates a lazy connection - it connects on first RPC call.
+	// Connection failures are handled via WaitForReady(false) on each RPC and
+	// the context timeout passed to each call.
 	conn, err := grpc.NewClient(
 		config.Endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()), // TODO: enable secured connection.
@@ -35,17 +29,6 @@ func NewRaftGRPCClient(config RaftGRPCClientConfig) (*RaftGRPCClient, error) {
 	)
 	if err != nil {
 		return nil, err
-	}
-
-	// Wait for connection to be ready with timeout
-	go func() {
-		conn.Connect()
-	}()
-	select {
-	case <-ctx.Done():
-		conn.Close()
-		return nil, ctx.Err()
-	default:
 	}
 
 	client := konsen.NewRaftClient(conn)

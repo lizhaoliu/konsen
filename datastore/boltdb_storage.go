@@ -103,6 +103,16 @@ func (b *BoltDB) SetVotedFor(candidateID string) error {
 	})
 }
 
+func (b *BoltDB) SetTermAndVotedFor(term uint64, candidateID string) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(statesBucketName)
+		if err := b.Put(currentTermKey, uint64ToBytes(term)); err != nil {
+			return err
+		}
+		return b.Put(votedForKey, []byte(candidateID))
+	})
+}
+
 func (b *BoltDB) GetLog(logIndex uint64) (*konsen.Log, error) {
 	var log *konsen.Log
 	if err := b.db.View(func(tx *bolt.Tx) error {
