@@ -122,10 +122,16 @@ type getSnapshotMsg struct {
 	ch chan<- *Snapshot
 }
 
+// getValueResp is the response for a getValueMsg.
+type getValueResp struct {
+	value []byte
+	err   error
+}
+
 // getValueMsg represents a message to retrieve a value by given key.
 type getValueMsg struct {
 	key []byte
-	ch  chan<- []byte
+	ch  chan<- getValueResp
 }
 
 // registerCondMsg represents a message to register a condition channel for a log index.
@@ -774,10 +780,7 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					v.ch <- snapshot
 				case getValueMsg:
 					val, err := sm.handleGetValue(v.key)
-					if err != nil {
-						log.Fatalf("%v", err)
-					}
-					v.ch <- val
+					v.ch <- getValueResp{value: val, err: err}
 				case registerCondMsg:
 					sm.condMap[v.logIndex] = v.condCh
 				case unregisterCondMsg:
@@ -1085,7 +1088,7 @@ func (sm *StateMachine) SetKeyValue(ctx context.Context, kv *konsen.KVList) erro
 }
 
 func (sm *StateMachine) GetValue(ctx context.Context, key []byte) ([]byte, error) {
-	ch := make(chan []byte, 1) // Buffered to prevent blocking message loop if caller times out
+	ch := make(chan getValueResp, 1) // Buffered to prevent blocking message loop if caller times out
 	select {
 	case sm.msgCh <- getValueMsg{key: key, ch: ch}:
 	case <-sm.stopCh:
@@ -1097,11 +1100,17 @@ func (sm *StateMachine) GetValue(ctx context.Context, key []byte) ([]byte, error
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case resp := <-ch:
-		return resp, nil
+		return resp.value, resp.err
 	}
 }
 
 func (sm *StateMachine) handleGetValue(key []byte) ([]byte, error) {
+	if sm.getRole() != konsen.Role_LEADER {
+		if sm.currentLeader == "" {
+			return nil, fmt.Errorf("no leader is elected yet")
+		}
+		return nil, fmt.Errorf("not the leader; current leader is %q", sm.currentLeader)
+	}
 	return sm.storage.GetValue(key)
 }
 
