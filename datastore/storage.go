@@ -53,4 +53,7 @@ type Storage interface {
 
 	// GetValue returns value of a key.
 	GetValue(key []byte) ([]byte, error)
+
+	// Close closes the storage and releases resources.
+	Close() error
 }

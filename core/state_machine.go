@@ -427,7 +427,7 @@ func (sm *StateMachine) isLogOnMajority(logIndex uint64) bool {
 			n++
 		}
 	}
-	return n > sm.getQuorum()
+	return n >= sm.majority()
 }
 
 // handleRequestVote handles a RequestVote request.
@@ -501,7 +501,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 	if resp.GetVoteGranted() {
 		sm.numVotes++
 		// If votes received from majority of servers, become leader.
-		if sm.numVotes > sm.getQuorum() {
+		if sm.numVotes >= sm.majority() {
 			if err := sm.becomeLeader(currentTerm); err != nil {
 				return fmt.Errorf("failed to become leader: %v", err)
 			}
@@ -891,8 +891,8 @@ func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataRe
 	}
 }
 
-func (sm *StateMachine) getQuorum() int {
-	return len(sm.cluster.Servers) / 2
+func (sm *StateMachine) majority() int {
+	return len(sm.cluster.Servers)/2 + 1
 }
 
 // handleAppendData processes a appendDataMsg, it writes the data into local (or on leader's) logs, returns after the
@@ -904,7 +904,7 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 	if sm.currentLeader == "" {
 		ch <- &konsen.AppendDataResp{
 			Success:      false,
-			ErrorMessage: fmt.Sprintf("no leader is elected yet (are there more than %d nodes down?)", sm.getQuorum()),
+			ErrorMessage: fmt.Sprintf("no leader is elected yet (are there more than %d nodes down?)", sm.majority()-1),
 		}
 		return nil
 	}
@@ -1000,7 +1000,7 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 			log.Debugf("Timeout while waiting for log[%d] to be committed and applied.", logIndex)
 			ch <- &konsen.AppendDataResp{
 				Success:      false,
-				ErrorMessage: fmt.Sprintf("failed to replicate onto quorum and apply commands (are there more than %d nodes down?)", sm.getQuorum()),
+				ErrorMessage: fmt.Sprintf("failed to replicate onto quorum and apply commands (are there more than %d nodes down?)", sm.majority()-1),
 			}
 		case <-sm.stopCh:
 			// Unregister on shutdown as well
