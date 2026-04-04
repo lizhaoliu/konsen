@@ -190,7 +190,13 @@ func (sm *StateMachine) setRole(role konsen.Role) {
 // AppendEntries puts the incoming AppendEntries request in main message channel and waits for result.
 func (sm *StateMachine) AppendEntries(ctx context.Context, req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
 	ch := make(chan *konsen.AppendEntriesResp, 1) // Buffered to prevent blocking message loop if caller times out
-	sm.msgCh <- appendEntriesWrap{req: req, ch: ch}
+	select {
+	case sm.msgCh <- appendEntriesWrap{req: req, ch: ch}:
+	case <-sm.stopCh:
+		return nil, fmt.Errorf("server has been shut down")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -202,7 +208,13 @@ func (sm *StateMachine) AppendEntries(ctx context.Context, req *konsen.AppendEnt
 // RequestVote puts the incoming RequestVote request in main message channel and waits for result.
 func (sm *StateMachine) RequestVote(ctx context.Context, req *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
 	ch := make(chan *konsen.RequestVoteResp, 1) // Buffered to prevent blocking message loop if caller times out
-	sm.msgCh <- requestVoteWrap{req: req, ch: ch}
+	select {
+	case sm.msgCh <- requestVoteWrap{req: req, ch: ch}:
+	case <-sm.stopCh:
+		return nil, fmt.Errorf("server has been shut down")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -238,6 +250,9 @@ func (sm *StateMachine) maybeBecomeFollower(term uint64) (uint64, error) {
 		currentTerm = term
 		sm.stopHeartbeatIfRunning()
 		sm.setRole(konsen.Role_FOLLOWER)
+		// Clear stale leader to prevent forwarding requests to self (which would
+		// cause a nil pointer panic since the local server is not in the clients map).
+		sm.currentLeader = ""
 	}
 	return currentTerm, nil
 }
@@ -274,6 +289,11 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 	}
 
 	// At this point, the request is coming from a legit leader, and request term == currentTerm.
+	// Per Raft paper Section 5.2: if a candidate receives AppendEntries from a leader with a term
+	// at least as large as its own, it recognizes the leader as legitimate and steps down.
+	if sm.getRole() == konsen.Role_CANDIDATE {
+		sm.setRole(konsen.Role_FOLLOWER)
+	}
 	// Only reset election timer for valid AppendEntries from current leader (per Raft paper Section 5.2).
 	sm.resetElectionTimer()
 	sm.currentLeader = req.GetLeaderId()
@@ -559,6 +579,11 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 		return nil
 	}
 
+	// Leader resets its own election timer when sending heartbeats to prevent
+	// spurious elections. Without this, the leader's election timer would fire
+	// every 1-2 seconds causing constant re-elections.
+	sm.resetElectionTimer()
+
 	currentTerm, err := sm.storage.GetCurrentTerm()
 	if err != nil {
 		return fmt.Errorf("failed to get current term: %v", err)
@@ -824,7 +849,13 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
 				if sm.getRole() != konsen.Role_LEADER {
 					return
 				}
-				sm.msgCh <- appendEntriesMsg{}
+				select {
+				case sm.msgCh <- appendEntriesMsg{}:
+				case <-sm.stopCh:
+					return
+				case <-stopCh:
+					return
+				}
 			}
 		}
 	}()
@@ -839,7 +870,13 @@ func (sm *StateMachine) nextTimeout() time.Duration {
 // AppendData stores the given data into state machine, and it returns after the data is replicated onto quorum.
 func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
 	ch := make(chan *konsen.AppendDataResp, 1) // Buffered to prevent blocking message loop if caller times out
-	sm.msgCh <- appendDataMsg{req: req, ch: ch}
+	select {
+	case sm.msgCh <- appendDataMsg{req: req, ch: ch}:
+	case <-sm.stopCh:
+		return nil, fmt.Errorf("server has been shut down")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -978,7 +1015,13 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 
 func (sm *StateMachine) GetSnapshot(ctx context.Context) (*Snapshot, error) {
 	ch := make(chan *Snapshot, 1) // Buffered to prevent blocking message loop if caller times out
-	sm.msgCh <- getSnapshotMsg{ch: ch}
+	select {
+	case sm.msgCh <- getSnapshotMsg{ch: ch}:
+	case <-sm.stopCh:
+		return nil, fmt.Errorf("server has been shut down")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1043,7 +1086,13 @@ func (sm *StateMachine) SetKeyValue(ctx context.Context, kv *konsen.KVList) erro
 
 func (sm *StateMachine) GetValue(ctx context.Context, key []byte) ([]byte, error) {
 	ch := make(chan []byte, 1) // Buffered to prevent blocking message loop if caller times out
-	sm.msgCh <- getValueMsg{key: key, ch: ch}
+	select {
+	case sm.msgCh <- getValueMsg{key: key, ch: ch}:
+	case <-sm.stopCh:
+		return nil, fmt.Errorf("server has been shut down")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
