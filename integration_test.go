@@ -3,6 +3,7 @@ package konsen_test
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"testing"
 	"time"
@@ -26,9 +27,11 @@ const (
 
 // inProcessClient implements core.RaftService by forwarding calls to a StateMachine directly.
 type inProcessClient struct {
-	mu        sync.RWMutex
-	target    *core.StateMachine
-	blocked bool // simulates network partition
+	mu       sync.RWMutex
+	target   *core.StateMachine
+	blocked  bool          // simulates network partition
+	delay    time.Duration // simulates network latency
+	dropRate float64       // probability of message drop [0.0, 1.0]
 }
 
 func newInProcessClient(target *core.StateMachine) *inProcessClient {
@@ -47,25 +50,71 @@ func (c *inProcessClient) isBlocked() bool {
 	return c.blocked
 }
 
-func (c *inProcessClient) AppendEntries(ctx context.Context, in *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
-	if c.isBlocked() {
+func (c *inProcessClient) setDelay(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.delay = d
+}
+
+func (c *inProcessClient) setDropRate(rate float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if rate < 0 {
+		rate = 0
+	} else if rate > 1 {
+		rate = 1
+	}
+	c.dropRate = rate
+}
+
+// simulateNetwork applies network effects (partition, delay, drops) and returns the target SM.
+// Reading target under the lock prevents races with restartNode updating it.
+func (c *inProcessClient) simulateNetwork(ctx context.Context) (*core.StateMachine, error) {
+	c.mu.RLock()
+	blocked := c.blocked
+	delay := c.delay
+	dropRate := c.dropRate
+	target := c.target
+	c.mu.RUnlock()
+
+	if blocked {
 		return nil, fmt.Errorf("network partition: connection refused")
 	}
-	return c.target.AppendEntries(ctx, in)
+	if dropRate > 0 && rand.Float64() < dropRate {
+		return nil, fmt.Errorf("network: message dropped")
+	}
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return target, nil
+}
+
+func (c *inProcessClient) AppendEntries(ctx context.Context, in *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
+	target, err := c.simulateNetwork(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return target.AppendEntries(ctx, in)
 }
 
 func (c *inProcessClient) RequestVote(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
-	if c.isBlocked() {
-		return nil, fmt.Errorf("network partition: connection refused")
+	target, err := c.simulateNetwork(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return c.target.RequestVote(ctx, in)
+	return target.RequestVote(ctx, in)
 }
 
 func (c *inProcessClient) AppendData(ctx context.Context, in *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
-	if c.isBlocked() {
-		return nil, fmt.Errorf("network partition: connection refused")
+	target, err := c.simulateNetwork(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return c.target.AppendData(ctx, in)
+	return target.AppendData(ctx, in)
 }
 
 func (c *inProcessClient) Close() error { return nil }
@@ -77,6 +126,7 @@ type testCluster struct {
 	storage map[string]*datastore.MemStorage
 	clients map[string]map[string]*inProcessClient // node -> peer -> client
 	cancels map[string]context.CancelFunc
+	stopped map[string]bool // tracks crashed/stopped nodes
 	mu      sync.Mutex
 }
 
@@ -88,6 +138,7 @@ func newTestCluster(t *testing.T, nodeNames []string) *testCluster {
 		storage: make(map[string]*datastore.MemStorage),
 		clients: make(map[string]map[string]*inProcessClient),
 		cancels: make(map[string]context.CancelFunc),
+		stopped: make(map[string]bool),
 	}
 
 	// Build cluster config.
@@ -171,38 +222,57 @@ func (tc *testCluster) stop() {
 	for _, cancel := range tc.cancels {
 		cancel()
 	}
-	for _, sm := range tc.nodes {
-		sm.Close()
+	for name, sm := range tc.nodes {
+		if !tc.stopped[name] {
+			sm.Close()
+		}
 	}
 }
 
-// waitForLeader waits until a single leader is elected or timeout expires.
+// waitForLeader waits until exactly one leader exists or timeout expires.
+// It skips stopped nodes and tolerates transient multi-leader states (e.g.
+// during re-elections) by continuing to poll until the cluster converges.
 func (tc *testCluster) waitForLeader(timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		leader := ""
+		tc.mu.Lock()
+		nodes := make(map[string]*core.StateMachine, len(tc.nodes))
 		for name, sm := range tc.nodes {
-			snapshot, err := sm.GetSnapshot(context.Background())
+			if !tc.stopped[name] {
+				nodes[name] = sm
+			}
+		}
+		tc.mu.Unlock()
+
+		leader := ""
+		multi := false
+		for name, sm := range nodes {
+			sctx, scancel := context.WithTimeout(context.Background(), 1*time.Second)
+			snapshot, err := sm.GetSnapshot(sctx)
+			scancel()
 			if err != nil {
 				continue
 			}
 			if snapshot.Role == konsen.Role_LEADER {
-				if leader != "" && leader != name {
-					return "", fmt.Errorf("multiple leaders: %s and %s", leader, name)
+				if leader != "" {
+					multi = true
+					break
 				}
 				leader = name
 			}
 		}
-		if leader != "" {
+		if leader != "" && !multi {
 			return leader, nil
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
-	return "", fmt.Errorf("no leader elected within %v", timeout)
+	return "", fmt.Errorf("no single leader elected within %v", timeout)
 }
 
 // partition isolates a node from the cluster (bidirectional).
 func (tc *testCluster) partition(nodeName string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
 	// Block outgoing connections from this node.
 	for _, client := range tc.clients[nodeName] {
 		client.setBlocked(true)
@@ -219,6 +289,8 @@ func (tc *testCluster) partition(nodeName string) {
 
 // heal restores connectivity for a node.
 func (tc *testCluster) heal(nodeName string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
 	// Unblock outgoing.
 	for _, client := range tc.clients[nodeName] {
 		client.setBlocked(false)
@@ -242,9 +314,15 @@ func (tc *testCluster) appendKV(leader string, key, value string) error {
 	if err != nil {
 		return err
 	}
+	tc.mu.Lock()
+	sm := tc.nodes[leader]
+	tc.mu.Unlock()
+	if sm == nil {
+		return fmt.Errorf("node %s not found", leader)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	resp, err := tc.nodes[leader].AppendData(ctx, &konsen.AppendDataReq{Data: data})
+	resp, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: data})
 	if err != nil {
 		return err
 	}
@@ -256,9 +334,15 @@ func (tc *testCluster) appendKV(leader string, key, value string) error {
 
 // getValue reads a value from a node.
 func (tc *testCluster) getValue(nodeName string, key string) (string, error) {
+	tc.mu.Lock()
+	sm := tc.nodes[nodeName]
+	tc.mu.Unlock()
+	if sm == nil {
+		return "", fmt.Errorf("node %s not found", nodeName)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	val, err := tc.nodes[nodeName].GetValue(ctx, []byte(key))
+	val, err := sm.GetValue(ctx, []byte(key))
 	if err != nil {
 		return "", err
 	}
