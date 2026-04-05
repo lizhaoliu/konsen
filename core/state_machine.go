@@ -58,6 +58,11 @@ type StateMachine struct {
 	wg   sync.WaitGroup
 	once sync.Once
 
+	// Configurable timeouts.
+	minTimeout  time.Duration
+	timeoutSpan time.Duration
+	heartbeat   time.Duration
+
 	// condMap stores channels for goroutines waiting on specific log indices to be applied.
 	// Key: log index (uint64), Value: chan struct{}
 	// Managed via message passing through registerCondMsg and unregisterCondMsg.
@@ -69,6 +74,11 @@ type StateMachineConfig struct {
 	Storage datastore.Storage      // Local storage instance.
 	Cluster *ClusterConfig         // Cluster configuration.
 	Clients map[string]RaftService // A map of "server name": "Raft service".
+
+	// Optional timeout overrides (zero values use defaults).
+	MinTimeout  time.Duration // Minimum election timeout.
+	TimeoutSpan time.Duration // Random span added to MinTimeout.
+	Heartbeat   time.Duration // Heartbeat interval.
 }
 
 // Snapshot is a snapshot of the internal state of a state machine.
@@ -151,6 +161,19 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 		return nil, fmt.Errorf("number of nodes in the cluster must be an odd number, got: %d", len(config.Cluster.Servers))
 	}
 
+	minTimeout := config.MinTimeout
+	if minTimeout == 0 {
+		minTimeout = defaultMinTimeout
+	}
+	timeoutSpan := config.TimeoutSpan
+	if timeoutSpan == 0 {
+		timeoutSpan = defaultTimeoutSpan
+	}
+	heartbeat := config.Heartbeat
+	if heartbeat == 0 {
+		heartbeat = defaultHeartbeat
+	}
+
 	sm := &StateMachine{
 		msgCh:           make(chan interface{}),
 		stopCh:          make(chan struct{}),
@@ -166,6 +189,10 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 
 		nextIndex:  make(map[string]uint64),
 		matchIndex: make(map[string]uint64),
+
+		minTimeout:  minTimeout,
+		timeoutSpan: timeoutSpan,
+		heartbeat:   heartbeat,
 
 		condMap: make(map[uint64]chan struct{}),
 	}
@@ -836,7 +863,7 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
 		defer sm.wg.Done()
 
 		// Heartbeat worker.
-		ticker := time.NewTicker(defaultHeartbeat)
+		ticker := time.NewTicker(sm.heartbeat)
 		defer ticker.Stop()
 		for {
 			select {
@@ -866,7 +893,7 @@ func (sm *StateMachine) startHeartbeatLoop(ctx context.Context) {
 
 // nextTimeout calculates the next election timeout duration.
 func (sm *StateMachine) nextTimeout() time.Duration {
-	timeout := rand.Int63n(int64(defaultTimeoutSpan)) + int64(defaultMinTimeout)
+	timeout := rand.Int63n(int64(sm.timeoutSpan)) + int64(sm.minTimeout)
 	return time.Duration(timeout)
 }
 
