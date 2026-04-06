@@ -1,0 +1,62 @@
+services:
+  node1:
+    build: .
+    command:
+      - "--cluster_config_path=/etc/konsen/cluster.yml"
+      - "--db_dir=/data/db"
+    volumes:
+      - ./conf/docker/node1.yml:/etc/konsen/cluster.yml:ro
+      - node1-data:/data
+    ports:
+      - "20001:20001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:20001/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - konsen
+
+  node2:
+    build: .
+    command:
+      - "--cluster_config_path=/etc/konsen/cluster.yml"
+      - "--db_dir=/data/db"
+    volumes:
+      - ./conf/docker/node2.yml:/etc/konsen/cluster.yml:ro
+      - node2-data:/data
+    ports:
+      - "20002:20001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:20001/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - konsen
+
+  node3:
+    build: .
+    command:
+      - "--cluster_config_path=/etc/konsen/cluster.yml"
+      - "--db_dir=/data/db"
+    volumes:
+      - ./conf/docker/node3.yml:/etc/konsen/cluster.yml:ro
+      - node3-data:/data
+    ports:
+      - "20003:20001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:20001/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - konsen
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  konsen:

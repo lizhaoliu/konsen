@@ -155,6 +155,17 @@ type unregisterCondMsg struct {
 	logIndex uint64
 }
 
+// healthCheckResp is the response for a healthCheckMsg.
+type healthCheckResp struct {
+	role          konsen.Role
+	currentLeader string
+}
+
+// healthCheckMsg is a lightweight message to check if the message loop is responsive.
+type healthCheckMsg struct {
+	ch chan<- healthCheckResp
+}
+
 // NewStateMachine creates a new instance of the state machine.
 func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 	if len(config.Cluster.Servers)%2 != 1 {
@@ -812,6 +823,11 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					sm.condMap[v.logIndex] = v.condCh
 				case unregisterCondMsg:
 					delete(sm.condMap, v.logIndex)
+				case healthCheckMsg:
+					v.ch <- healthCheckResp{
+						role:          sm.getRole(),
+						currentLeader: sm.currentLeader,
+					}
 				default:
 					log.Fatalf("Unrecognized message: %v", v)
 				}
@@ -1041,6 +1057,25 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 			}
 		}
 	}()
+}
+
+// HealthCheck sends a lightweight ping through the message loop and returns the node's
+// current role and leader. If the message loop is unresponsive, the context will time out.
+func (sm *StateMachine) HealthCheck(ctx context.Context) (role konsen.Role, leader string, err error) {
+	ch := make(chan healthCheckResp, 1)
+	select {
+	case sm.msgCh <- healthCheckMsg{ch: ch}:
+	case <-sm.stopCh:
+		return 0, "", fmt.Errorf("server has been shut down")
+	case <-ctx.Done():
+		return 0, "", ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return 0, "", ctx.Err()
+	case resp := <-ch:
+		return resp.role, resp.currentLeader, nil
+	}
 }
 
 func (sm *StateMachine) GetSnapshot(ctx context.Context) (*Snapshot, error) {

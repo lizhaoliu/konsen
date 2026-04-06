@@ -48,6 +48,35 @@ func NewServer(config ServerConfig) *Server {
 func (s *Server) initialize() {
 	s.router.GET(serviceRelPath, s.getHandler)
 	s.router.POST(serviceRelPath, s.postHandler)
+	s.router.GET("/health", s.healthHandler)
+	s.router.GET("/ready", s.readyHandler)
+}
+
+func (s *Server) healthHandler(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	role, leader, err := s.sm.HealthCheck(ctx)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy", "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "healthy", "role": role.String(), "leader": leader})
+}
+
+func (s *Server) readyHandler(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	role, leader, err := s.sm.HealthCheck(ctx)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "error": err.Error()})
+		return
+	}
+	// Node is ready if it is the leader, or if it knows who the leader is.
+	if role == konsen.Role_LEADER || leader != "" {
+		c.JSON(http.StatusOK, gin.H{"status": "ready", "role": role.String(), "leader": leader})
+		return
+	}
+	c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "reason": "no leader elected"})
 }
 
 func (s *Server) getHandler(c *gin.Context) {

@@ -1,0 +1,9 @@
+servers:
+  node1: node1:10001
+  node2: node2:10001
+  node3: node3:10001
+httpServers:
+  node1: 0.0.0.0:20001
+  node2: 0.0.0.0:20001
+  node3: 0.0.0.0:20001
+localServerName: node3
