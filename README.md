@@ -73,7 +73,7 @@ value, _ := sm.GetValue(ctx, []byte("key"))
 
 ### HTTP API
 
-The HTTP server (built with Gin) exposes two endpoints:
+The HTTP server (built with Gin) exposes the following endpoints:
 
 ```bash
 # Write key-value pairs (non-leaders forward to the leader).
@@ -81,11 +81,50 @@ curl -X POST http://localhost:20001/konsen -d "key1=value1&key2=value2"
 
 # Read a value (leader-only).
 curl "http://localhost:20001/konsen?key=key1"
+
+# Health check — returns 200 if the node's message loop is responsive.
+curl http://localhost:20001/health
+
+# Readiness check — returns 200 if a leader is known.
+curl http://localhost:20001/ready
 ```
 
-## Build a Local Cluster
+## Deployment
 
 ### Cluster Configuration
+
+`servers` defines gRPC endpoints for inter-node Raft RPCs. `httpServers` defines HTTP endpoints that accept client reads and writes. The cluster must have an odd number of nodes.
+
+### Docker Compose
+
+Runs a 3-node cluster on a single host:
+
+```bash
+docker compose up -d
+```
+
+The HTTP API is available at `localhost:20001`, `localhost:20002`, and `localhost:20003`. Node configs are in `conf/docker/`.
+
+### Kubernetes (k3s)
+
+Deploys a 3-node StatefulSet with stable DNS identities and persistent storage. An init container injects each pod's name as `localServerName`, so a single ConfigMap covers all nodes.
+
+```bash
+# Build and import the image on your k3s node(s)
+docker build -t konsen:latest .
+
+# Apply manifests
+kubectl apply -f conf/k8s/namespace.yml
+kubectl apply -f conf/k8s/configmap.yml
+kubectl apply -f conf/k8s/service.yml
+kubectl apply -f conf/k8s/statefulset.yml
+```
+
+The HTTP API is exposed via NodePort at `<node-ip>:30001`. Pods use the `local-path` storage class (k3s default) for persistent volumes.
+
+Manifests are in `conf/k8s/`.
+
+### Local (bare-metal)
 
 Edit `conf/cluster.yml`:
 
@@ -104,17 +143,7 @@ httpServers:
   node5: 192.168.86.25:20005
 ```
 
-`servers` defines gRPC endpoints for inter-node Raft RPCs. `httpServers` defines HTTP endpoints that accept client reads and writes. The cluster must have an odd number of nodes.
-
-### (Optional) Regenerate Protobuf Code
-
-```bash
-protoc --go_out=. --go_opt=paths=source_relative \
-       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-       proto/*.proto
-```
-
-### Build and Run
+Build and run:
 
 ```bash
 python build_cluster.py
@@ -133,6 +162,14 @@ output/
 ```
 
 Start each node by running its `bootstrap.sh`.
+
+### (Optional) Regenerate Protobuf Code
+
+```bash
+protoc --go_out=. --go_opt=paths=source_relative \
+       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+       proto/*.proto
+```
 
 ## Architecture
 

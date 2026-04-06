@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: konsen
+  namespace: konsen
+spec:
+  serviceName: konsen-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: konsen
+  template:
+    metadata:
+      labels:
+        app: konsen
+    spec:
+      terminationGracePeriodSeconds: 15
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: konsen
+                topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      initContainers:
+        - name: inject-node-name
+          image: busybox:1.37
+          command: ["sh", "-c"]
+          args:
+            - |
+              cp /etc/konsen-shared/cluster.yml /etc/konsen/cluster.yml
+              echo "localServerName: ${HOSTNAME}" >> /etc/konsen/cluster.yml
+          volumeMounts:
+            - name: shared-config
+              mountPath: /etc/konsen-shared
+            - name: node-config
+              mountPath: /etc/konsen
+      containers:
+        - name: konsen
+          image: konsen:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--cluster_config_path=/etc/konsen/cluster.yml"
+            - "--db_dir=/data/db"
+          ports:
+            - name: raft
+              containerPort: 10001
+            - name: http
+              containerPort: 20001
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: node-config
+              mountPath: /etc/konsen
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: shared-config
+          configMap:
+            name: konsen-config
+        - name: node-config
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 1Gi

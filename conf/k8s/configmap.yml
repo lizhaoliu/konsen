@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: konsen-config
+  namespace: konsen
+data:
+  cluster.yml: |
+    servers:
+      konsen-0: konsen-0.konsen-headless.konsen.svc.cluster.local:10001
+      konsen-1: konsen-1.konsen-headless.konsen.svc.cluster.local:10001
+      konsen-2: konsen-2.konsen-headless.konsen.svc.cluster.local:10001
+    httpServers:
+      konsen-0: 0.0.0.0:20001
+      konsen-1: 0.0.0.0:20001
+      konsen-2: 0.0.0.0:20001
