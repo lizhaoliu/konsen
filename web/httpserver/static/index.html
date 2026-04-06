@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Konsen</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #333; }
+  header { background: #1a1a2e; color: #fff; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 20px; font-weight: 600; }
+  .node-badge { background: rgba(255,255,255,0.15); padding: 4px 12px; border-radius: 12px; font-size: 13px; }
+  .role-badge { padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; text-transform: uppercase; }
+  .role-LEADER { background: #22c55e; color: #fff; }
+  .role-FOLLOWER { background: #3b82f6; color: #fff; }
+  .role-CANDIDATE { background: #eab308; color: #fff; }
+
+  .tabs { display: flex; gap: 0; background: #fff; border-bottom: 2px solid #e5e5e5; padding: 0 24px; }
+  .tab { padding: 12px 20px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; font-size: 14px; font-weight: 500; color: #666; }
+  .tab:hover { color: #333; }
+  .tab.active { color: #1a1a2e; border-bottom-color: #1a1a2e; }
+
+  .panel { display: none; padding: 24px; max-width: 960px; margin: 0 auto; }
+  .panel.active { display: block; }
+
+  .card { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .card h3 { font-size: 14px; text-transform: uppercase; color: #888; margin-bottom: 12px; letter-spacing: 0.5px; }
+
+  .form-row { display: flex; gap: 8px; margin-bottom: 12px; align-items: flex-start; }
+  input[type="text"], textarea { border: 1px solid #ddd; border-radius: 6px; padding: 8px 12px; font-size: 14px; font-family: inherit; flex: 1; }
+  input[type="text"]:focus, textarea:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.15); }
+  textarea { min-height: 60px; resize: vertical; }
+  button { background: #1a1a2e; color: #fff; border: none; border-radius: 6px; padding: 8px 16px; font-size: 14px; cursor: pointer; white-space: nowrap; }
+  button:hover { background: #2a2a4e; }
+  button.secondary { background: #e5e5e5; color: #333; }
+  button.secondary:hover { background: #d5d5d5; }
+
+  .msg { padding: 8px 12px; border-radius: 6px; font-size: 13px; margin-top: 8px; font-family: monospace; white-space: pre-wrap; word-break: break-all; }
+  .msg.ok { background: #dcfce7; color: #166534; }
+  .msg.err { background: #fee2e2; color: #991b1b; }
+  .msg.info { background: #dbeafe; color: #1e40af; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; font-weight: 600; color: #666; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; padding: 8px 12px; border-bottom: 2px solid #e5e5e5; }
+  td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; }
+  tr:hover td { background: #f9f9f9; }
+  .clickable { cursor: pointer; color: #3b82f6; }
+  .clickable:hover { text-decoration: underline; }
+
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .stat { text-align: center; }
+  .stat .value { font-size: 24px; font-weight: 700; color: #1a1a2e; }
+  .stat .label { font-size: 12px; color: #888; margin-top: 2px; }
+
+  .empty { color: #999; font-style: italic; padding: 20px; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Konsen</h1>
+  <span class="node-badge" id="hdr-node">-</span>
+  <span class="role-badge" id="hdr-role">-</span>
+  <span style="margin-left:auto; font-size:13px; opacity:0.7">Leader: <span id="hdr-leader">-</span></span>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-panel="kv">Key-Value</div>
+  <div class="tab" data-panel="cluster">Cluster Status</div>
+</div>
+
+<div class="panel active" id="panel-kv">
+  <div class="card">
+    <h3>Put</h3>
+    <div class="form-row">
+      <input type="text" id="put-key" placeholder="Key">
+      <input type="text" id="put-val" placeholder="Value">
+      <button onclick="doPut()">Put</button>
+    </div>
+    <div id="put-msg"></div>
+  </div>
+
+  <div class="card">
+    <h3>Get</h3>
+    <div class="form-row">
+      <input type="text" id="get-key" placeholder="Key">
+      <button onclick="doGet()">Get</button>
+    </div>
+    <div id="get-msg"></div>
+  </div>
+
+  <div class="card">
+    <h3>Browse Keys</h3>
+    <div class="form-row">
+      <input type="text" id="browse-prefix" placeholder="Prefix filter (optional)">
+      <button onclick="doList()">List</button>
+    </div>
+    <div id="keys-table"></div>
+  </div>
+</div>
+
+<div class="panel" id="panel-cluster">
+  <div class="card">
+    <h3>Node Info</h3>
+    <div class="stats-grid" id="stats-grid">
+      <div class="stat"><div class="value" id="st-term">-</div><div class="label">Term</div></div>
+      <div class="stat"><div class="value" id="st-commit">-</div><div class="label">Commit Index</div></div>
+      <div class="stat"><div class="value" id="st-applied">-</div><div class="label">Last Applied</div></div>
+      <div class="stat"><div class="value" id="st-logs">-</div><div class="label">Log Entries</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Peer Replication</h3>
+    <div id="peer-table"></div>
+  </div>
+</div>
+
+<script>
+// Tabs
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('panel-' + tab.dataset.panel).classList.add('active');
+  });
+});
+
+function msg(id, text, cls) {
+  const el = document.getElementById(id);
+  el.className = 'msg ' + cls;
+  el.textContent = text;
+}
+
+// Put
+async function doPut() {
+  const key = document.getElementById('put-key').value.trim();
+  const value = document.getElementById('put-val').value;
+  if (!key) { msg('put-msg', 'Key is required', 'err'); return; }
+  try {
+    const r = await fetch('/api/kv', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key, value})
+    });
+    const d = await r.json();
+    if (r.ok && d.success) {
+      msg('put-msg', 'OK', 'ok');
+    } else {
+      msg('put-msg', d.error || 'Failed', 'err');
+    }
+  } catch(e) { msg('put-msg', e.message, 'err'); }
+}
+
+// Get
+async function doGet() {
+  const key = document.getElementById('get-key').value.trim();
+  if (!key) { msg('get-msg', 'Key is required', 'err'); return; }
+  try {
+    const r = await fetch('/api/kv?key=' + encodeURIComponent(key));
+    const d = await r.json();
+    if (!r.ok) { msg('get-msg', d.error || 'Error', 'err'); return; }
+    if (d.found) {
+      msg('get-msg', d.value, 'info');
+    } else {
+      msg('get-msg', 'Key not found', 'err');
+    }
+  } catch(e) { msg('get-msg', e.message, 'err'); }
+}
+
+// List Keys
+async function doList() {
+  const prefix = document.getElementById('browse-prefix').value.trim();
+  const container = document.getElementById('keys-table');
+  try {
+    let url = '/api/keys?limit=200';
+    if (prefix) url += '&prefix=' + encodeURIComponent(prefix);
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!r.ok) { container.innerHTML = '<div class="msg err">' + (d.error || 'Error') + '</div>'; return; }
+    const keys = d.keys || [];
+    if (keys.length === 0) {
+      container.innerHTML = '<div class="empty">No keys found</div>';
+      return;
+    }
+    let html = '<table><thead><tr><th>Key</th><th style="width:60px"></th></tr></thead><tbody>';
+    keys.forEach(k => {
+      const ek = k.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+      html += '<tr><td class="clickable" onclick="fetchKey(\'' + ek.replace(/'/g,"\\'") + '\')">' + ek + '</td>';
+      html += '<td><button class="secondary" onclick="fetchKey(\'' + ek.replace(/'/g,"\\'") + '\')">Get</button></td></tr>';
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch(e) { container.innerHTML = '<div class="msg err">' + e.message + '</div>'; }
+}
+
+function fetchKey(key) {
+  document.getElementById('get-key').value = key;
+  doGet();
+  // Scroll to get section
+  document.getElementById('get-key').scrollIntoView({behavior: 'smooth', block: 'center'});
+}
+
+// Enter key support
+document.getElementById('put-val').addEventListener('keydown', e => { if (e.key === 'Enter') doPut(); });
+document.getElementById('get-key').addEventListener('keydown', e => { if (e.key === 'Enter') doGet(); });
+document.getElementById('browse-prefix').addEventListener('keydown', e => { if (e.key === 'Enter') doList(); });
+
+// Cluster status polling
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    if (!r.ok) return;
+
+    document.getElementById('hdr-node').textContent = d.node || '-';
+    const roleEl = document.getElementById('hdr-role');
+    roleEl.textContent = d.role || '-';
+    roleEl.className = 'role-badge role-' + (d.role || '');
+    document.getElementById('hdr-leader').textContent = d.currentLeader || '(none)';
+
+    document.getElementById('st-term').textContent = d.currentTerm ?? '-';
+    document.getElementById('st-commit').textContent = d.commitIndex ?? '-';
+    document.getElementById('st-applied').textContent = d.lastApplied ?? '-';
+    document.getElementById('st-logs').textContent = d.logCount ?? '-';
+
+    // Peer table
+    const ni = d.nextIndex || {};
+    const mi = d.matchIndex || {};
+    const peers = Object.keys(ni);
+    const container = document.getElementById('peer-table');
+    if (peers.length === 0) {
+      container.innerHTML = '<div class="empty">Peer replication data is only available on the leader node.</div>';
+    } else {
+      let html = '<table><thead><tr><th>Peer</th><th>Next Index</th><th>Match Index</th></tr></thead><tbody>';
+      peers.sort().forEach(p => {
+        html += '<tr><td>' + p + '</td><td>' + (ni[p] ?? '-') + '</td><td>' + (mi[p] ?? '-') + '</td></tr>';
+      });
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    }
+  } catch(e) { /* silent */ }
+}
+
+refreshStatus();
+setInterval(refreshStatus, 2000);
+
+// Initial key list
+doList();
+</script>
+</body>
+</html>

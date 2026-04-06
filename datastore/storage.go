@@ -54,6 +54,10 @@ type Storage interface {
 	// GetValue returns value of a key.
 	GetValue(key []byte) ([]byte, error)
 
+	// ListKeys returns stored KV keys matching the given prefix.
+	// If prefix is nil, all keys are returned. Limit caps the result count (0 = no limit).
+	ListKeys(prefix []byte, limit int) ([][]byte, error)
+
 	// Close closes the storage and releases resources.
 	Close() error
 }

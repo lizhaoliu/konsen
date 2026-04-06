@@ -144,6 +144,19 @@ type getValueMsg struct {
 	ch  chan<- getValueResp
 }
 
+// listKeysResp is the response for a listKeysMsg.
+type listKeysResp struct {
+	keys [][]byte
+	err  error
+}
+
+// listKeysMsg represents a message to list stored KV keys.
+type listKeysMsg struct {
+	prefix []byte
+	limit  int
+	ch     chan<- listKeysResp
+}
+
 // registerCondMsg represents a message to register a condition channel for a log index.
 type registerCondMsg struct {
 	logIndex uint64
@@ -818,6 +831,9 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					v.ch <- snapshot
 				case getValueMsg:
 					sm.handleGetValue(v.key, v.ch)
+				case listKeysMsg:
+					keys, err := sm.storage.ListKeys(v.prefix, v.limit)
+					v.ch <- listKeysResp{keys: keys, err: err}
 				case registerCondMsg:
 					sm.condMap[v.logIndex] = v.condCh
 				case unregisterCondMsg:
@@ -1162,6 +1178,25 @@ func (sm *StateMachine) GetValue(ctx context.Context, key []byte) ([]byte, error
 		return nil, ctx.Err()
 	case resp := <-ch:
 		return resp.value, resp.err
+	}
+}
+
+// ListKeys returns stored KV keys matching the given prefix. This is a local read
+// (not forwarded to the leader) since it's intended for browsing/debugging.
+func (sm *StateMachine) ListKeys(ctx context.Context, prefix []byte, limit int) ([][]byte, error) {
+	ch := make(chan listKeysResp, 1)
+	select {
+	case sm.msgCh <- listKeysMsg{prefix: prefix, limit: limit, ch: ch}:
+	case <-sm.stopCh:
+		return nil, fmt.Errorf("server has been shut down")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		return resp.keys, resp.err
 	}
 }
 

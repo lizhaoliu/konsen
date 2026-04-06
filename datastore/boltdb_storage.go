@@ -256,6 +256,48 @@ func (b *BoltDB) GetValue(key []byte) ([]byte, error) {
 	return value, nil
 }
 
+func (b *BoltDB) ListKeys(prefix []byte, limit int) ([][]byte, error) {
+	var keys [][]byte
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(kvBucketName).Cursor()
+
+		var k, _ []byte
+		if len(prefix) > 0 {
+			k, _ = c.Seek(prefix)
+		} else {
+			k, _ = c.First()
+		}
+
+		for ; k != nil; k, _ = c.Next() {
+			if len(prefix) > 0 && !hasPrefix(k, prefix) {
+				break
+			}
+			if limit > 0 && len(keys) >= limit {
+				break
+			}
+			key := make([]byte, len(k))
+			copy(key, k)
+			keys = append(keys, key)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+func hasPrefix(s, prefix []byte) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	for i := range prefix {
+		if s[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (b *BoltDB) Close() error {
 	return b.db.Close()
 }

@@ -169,6 +169,29 @@ func (m *MemStorage) GetValue(key []byte) ([]byte, error) {
 	return result, nil
 }
 
+func (m *MemStorage) ListKeys(prefix []byte, limit int) ([][]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var keys []string
+	p := string(prefix)
+	for k := range m.kv {
+		if len(prefix) == 0 || len(k) >= len(p) && k[:len(p)] == p {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
+
+	result := make([][]byte, len(keys))
+	for i, k := range keys {
+		result[i] = []byte(k)
+	}
+	return result, nil
+}
+
 func (m *MemStorage) Close() error {
 	return nil
 }

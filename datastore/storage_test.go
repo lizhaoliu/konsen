@@ -379,6 +379,82 @@ func TestKeyValue(t *testing.T) {
 	}
 }
 
+func TestListKeys(t *testing.T) {
+	for _, tc := range allFactories() {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cleanup := tc.factory(t)
+			defer cleanup()
+
+			// Empty store returns no keys.
+			keys, err := s.ListKeys(nil, 0)
+			if err != nil {
+				t.Fatalf("ListKeys empty: %v", err)
+			}
+			if len(keys) != 0 {
+				t.Fatalf("expected 0 keys, got %d", len(keys))
+			}
+
+			// Insert some keys.
+			for _, kv := range []struct{ k, v string }{
+				{"apple", "1"},
+				{"app", "2"},
+				{"banana", "3"},
+				{"band", "4"},
+				{"cherry", "5"},
+			} {
+				if err := s.SetValue([]byte(kv.k), []byte(kv.v)); err != nil {
+					t.Fatalf("SetValue(%q): %v", kv.k, err)
+				}
+			}
+
+			// List all keys.
+			keys, err = s.ListKeys(nil, 0)
+			if err != nil {
+				t.Fatalf("ListKeys all: %v", err)
+			}
+			if len(keys) != 5 {
+				t.Fatalf("expected 5 keys, got %d", len(keys))
+			}
+
+			// List with prefix.
+			keys, err = s.ListKeys([]byte("app"), 0)
+			if err != nil {
+				t.Fatalf("ListKeys prefix: %v", err)
+			}
+			if len(keys) != 2 {
+				t.Errorf("expected 2 keys with prefix 'app', got %d: %v", len(keys), keys)
+			}
+
+			// List with prefix "ban".
+			keys, err = s.ListKeys([]byte("ban"), 0)
+			if err != nil {
+				t.Fatalf("ListKeys prefix ban: %v", err)
+			}
+			if len(keys) != 2 {
+				t.Errorf("expected 2 keys with prefix 'ban', got %d: %v", len(keys), keys)
+			}
+
+			// List with limit.
+			keys, err = s.ListKeys(nil, 3)
+			if err != nil {
+				t.Fatalf("ListKeys limit: %v", err)
+			}
+			if len(keys) != 3 {
+				t.Errorf("expected 3 keys with limit, got %d", len(keys))
+			}
+
+			// No match prefix.
+			keys, err = s.ListKeys([]byte("zzz"), 0)
+			if err != nil {
+				t.Fatalf("ListKeys no match: %v", err)
+			}
+			if len(keys) != 0 {
+				t.Errorf("expected 0 keys for prefix 'zzz', got %d", len(keys))
+			}
+		})
+	}
+}
+
 func TestClose(t *testing.T) {
 	for _, tc := range allFactories() {
 		t.Run(tc.name, func(t *testing.T) {

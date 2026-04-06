@@ -261,6 +261,38 @@ func (b *Badger) GetValue(key []byte) ([]byte, error) {
 	return value, nil
 }
 
+func (b *Badger) ListKeys(prefix []byte, limit int) ([][]byte, error) {
+	var keys [][]byte
+	kvPrefix := []byte("kv:")
+	seekPrefix := make([]byte, 0, 3+len(prefix))
+	seekPrefix = append(seekPrefix, kvPrefix...)
+	seekPrefix = append(seekPrefix, prefix...)
+
+	if err := b.stateDB.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Prefix = seekPrefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek(seekPrefix); it.Valid(); it.Next() {
+			if limit > 0 && len(keys) >= limit {
+				break
+			}
+			item := it.Item()
+			k := item.Key()
+			// Strip the "kv:" prefix to return the user-facing key.
+			userKey := make([]byte, len(k)-3)
+			copy(userKey, k[3:])
+			keys = append(keys, userKey)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
 func (b *Badger) Close() error {
 	stateDBErr := b.stateDB.Close()
 	logDBErr := b.logDB.Close()
