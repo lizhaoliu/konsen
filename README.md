@@ -71,9 +71,33 @@ sm.SetKeyValue(ctx, &konsen.KVList{
 value, _ := sm.GetValue(ctx, []byte("key"))
 ```
 
+### Web UI
+
+Each node serves an embedded web UI at `/` for browsing keys, reading/writing values, and viewing cluster status (role, term, commit index, peer replication).
+
 ### HTTP API
 
 The HTTP server (built with Gin) exposes the following endpoints:
+
+#### JSON API
+
+```bash
+# Get a value.
+curl "http://localhost:20001/api/kv?key=key1"
+
+# Put a value (non-leaders forward to the leader).
+curl -X POST http://localhost:20001/api/kv \
+  -H "Content-Type: application/json" \
+  -d '{"key": "key1", "value": "value1"}'
+
+# List keys (with optional prefix filter and limit).
+curl "http://localhost:20001/api/keys?prefix=app&limit=100"
+
+# Cluster status (role, term, commit index, peer replication).
+curl http://localhost:20001/api/status
+```
+
+#### Legacy Endpoints
 
 ```bash
 # Write key-value pairs (non-leaders forward to the leader).
@@ -81,7 +105,11 @@ curl -X POST http://localhost:20001/konsen -d "key1=value1&key2=value2"
 
 # Read a value (leader-only).
 curl "http://localhost:20001/konsen?key=key1"
+```
 
+#### Health
+
+```bash
 # Health check — returns 200 if the node's message loop is responsive.
 curl http://localhost:20001/health
 
@@ -182,10 +210,12 @@ protoc --go_out=. --go_opt=paths=source_relative \
 ## Architecture
 
 ```text
-Client ─── HTTP API ─── StateMachine ─── gRPC ─── Remote Nodes
-                              │
-                          Storage
-                        (Badger/BoltDB)
+Browser ─── Web UI (embedded)
+                │
+Client ──── HTTP API ─── StateMachine ─── gRPC ─── Remote Nodes
+          (JSON + Legacy)       │
+                            Storage
+                          (Badger/BoltDB)
 ```
 
 See [docs/design.md](docs/design.md) for the full design document covering the Raft implementation, concurrency model, storage layer, and safety properties.
