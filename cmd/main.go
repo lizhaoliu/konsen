@@ -78,7 +78,7 @@ func main() {
 		logrus.Fatalf("%v", err)
 	}
 
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
+	if err := os.MkdirAll(dbDir, 0700); err != nil {
 		logrus.Fatalf("Failed to create dir: %v", err)
 	}
 	storage, err := datastore.NewBadger(datastore.BadgerConfig{
@@ -148,8 +148,8 @@ func main() {
 		logrus.Errorf("HTTP server shutdown error: %v", err)
 	}
 
-	sm.Close()
 	raftServer.Stop()
+	sm.Close()
 	closeClients(clients)
 	storage.Close()
 	logrus.Info("Shutdown complete.")

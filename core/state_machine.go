@@ -127,9 +127,15 @@ type putMsg struct {
 	ch  chan<- *konsen.PutResp
 }
 
+// getSnapshotResp is the response for a getSnapshotMsg.
+type getSnapshotResp struct {
+	snapshot *Snapshot
+	err      error
+}
+
 // getSnapshotMsg represents a message to generate a state snapshot.
 type getSnapshotMsg struct {
-	ch chan<- *Snapshot
+	ch chan<- getSnapshotResp
 }
 
 // getValueResp is the response for a getValueMsg.
@@ -177,6 +183,29 @@ type healthCheckResp struct {
 // healthCheckMsg is a lightweight message to check if the message loop is responsive.
 type healthCheckMsg struct {
 	ch chan<- healthCheckResp
+}
+
+// StatusSnapshot is a lightweight snapshot for status reporting, without loading all logs.
+type StatusSnapshot struct {
+	CurrentTerm   uint64
+	CommitIndex   uint64
+	LastApplied   uint64
+	Role          konsen.Role
+	CurrentLeader string
+	NextIndex     map[string]uint64
+	MatchIndex    map[string]uint64
+	LogCount      uint64
+}
+
+// getStatusResp is the response for a getStatusMsg.
+type getStatusResp struct {
+	status *StatusSnapshot
+	err    error
+}
+
+// getStatusMsg represents a message to retrieve a lightweight status snapshot.
+type getStatusMsg struct {
+	ch chan<- getStatusResp
 }
 
 // NewStateMachine creates a new instance of the state machine.
@@ -793,14 +822,18 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					// Process incoming AppendEntries request.
 					resp, err := sm.handleAppendEntries(v.req)
 					if err != nil {
-						log.Fatalf("%v", err)
+						log.Errorf("handleAppendEntries failed: %v", err)
+						v.ch <- &konsen.AppendEntriesResp{Success: false}
+						continue
 					}
 					v.ch <- resp
 				case requestVoteWrap:
 					// Process incoming RequestVote request.
 					resp, err := sm.handleRequestVote(v.req)
 					if err != nil {
-						log.Fatalf("%v", err)
+						log.Errorf("handleRequestVote failed: %v", err)
+						v.ch <- &konsen.RequestVoteResp{VoteGranted: false}
+						continue
 					}
 					v.ch <- resp
 				case appendEntriesRespWrap:
@@ -821,14 +854,18 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					}
 				case putMsg:
 					if err := sm.handlePut(v.req, v.ch); err != nil {
-						log.Fatalf("%v", err)
+						log.Errorf("handlePut failed: %v", err)
+						v.ch <- &konsen.PutResp{
+							Success:      false,
+							ErrorMessage: "internal storage error",
+						}
 					}
 				case getSnapshotMsg:
 					snapshot, err := sm.handleGetSnapshot()
 					if err != nil {
-						log.Fatalf("%v", err)
+						log.Errorf("handleGetSnapshot failed: %v", err)
 					}
-					v.ch <- snapshot
+					v.ch <- getSnapshotResp{snapshot: snapshot, err: err}
 				case getValueMsg:
 					sm.handleGetValue(v.key, v.ch)
 				case listKeysMsg:
@@ -843,6 +880,12 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 						role:          sm.getRole(),
 						currentLeader: sm.currentLeader,
 					}
+				case getStatusMsg:
+					status, err := sm.handleGetStatus()
+					if err != nil {
+						log.Errorf("handleGetStatus failed: %v", err)
+					}
+					v.ch <- getStatusResp{status: status, err: err}
 				default:
 					log.Fatalf("Unrecognized message: %v", v)
 				}
@@ -1094,7 +1137,7 @@ func (sm *StateMachine) HealthCheck(ctx context.Context) (role konsen.Role, lead
 }
 
 func (sm *StateMachine) GetSnapshot(ctx context.Context) (*Snapshot, error) {
-	ch := make(chan *Snapshot, 1) // Buffered to prevent blocking message loop if caller times out
+	ch := make(chan getSnapshotResp, 1) // Buffered to prevent blocking message loop if caller times out
 	select {
 	case sm.msgCh <- getSnapshotMsg{ch: ch}:
 	case <-sm.stopCh:
@@ -1106,7 +1149,7 @@ func (sm *StateMachine) GetSnapshot(ctx context.Context) (*Snapshot, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case resp := <-ch:
-		return resp, nil
+		return resp.snapshot, resp.err
 	}
 }
 
@@ -1147,6 +1190,53 @@ func (sm *StateMachine) handleGetSnapshot() (*Snapshot, error) {
 		LogTerms:      logTerms,
 		LogBytes:      logBytes,
 	}, nil
+}
+
+func (sm *StateMachine) handleGetStatus() (*StatusSnapshot, error) {
+	currentTerm, err := sm.storage.GetCurrentTerm()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current term: %v", err)
+	}
+	lastLogIndex, err := sm.storage.LastLogIndex()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get last log index: %v", err)
+	}
+	nextIndexMap := make(map[string]uint64)
+	for k, v := range sm.nextIndex {
+		nextIndexMap[k] = v
+	}
+	matchIndexMap := make(map[string]uint64)
+	for k, v := range sm.matchIndex {
+		matchIndexMap[k] = v
+	}
+	return &StatusSnapshot{
+		CurrentTerm:   currentTerm,
+		CommitIndex:   sm.commitIndex,
+		LastApplied:   sm.lastApplied,
+		Role:          sm.getRole(),
+		CurrentLeader: sm.currentLeader,
+		NextIndex:     nextIndexMap,
+		MatchIndex:    matchIndexMap,
+		LogCount:      lastLogIndex,
+	}, nil
+}
+
+// GetStatus returns a lightweight status snapshot without loading all logs.
+func (sm *StateMachine) GetStatus(ctx context.Context) (*StatusSnapshot, error) {
+	ch := make(chan getStatusResp, 1)
+	select {
+	case sm.msgCh <- getStatusMsg{ch: ch}:
+	case <-sm.stopCh:
+		return nil, fmt.Errorf("server has been shut down")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		return resp.status, resp.err
+	}
 }
 
 func (sm *StateMachine) SetKeyValue(ctx context.Context, kv *konsen.KVList) error {

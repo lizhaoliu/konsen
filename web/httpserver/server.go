@@ -10,12 +10,17 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/lizhaoliu/konsen/v2/core"
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
+	"github.com/sirupsen/logrus"
 )
 
 //go:embed static/index.html
 var indexHTML []byte
 
-const serviceRelPath = "/konsen"
+const (
+	serviceRelPath     = "/konsen"
+	maxRequestBodySize = 1 << 20 // 1 MB
+	maxListKeysLimit   = 1000
+)
 
 type Server struct {
 	sm              *core.StateMachine
@@ -54,6 +59,8 @@ func NewServer(config ServerConfig) *Server {
 }
 
 func (s *Server) initialize() {
+	s.router.Use(maxBodySizeMiddleware(maxRequestBodySize))
+
 	// UI
 	s.router.GET("/", s.indexHandler)
 
@@ -81,7 +88,8 @@ func (s *Server) healthHandler(c *gin.Context) {
 	defer cancel()
 	role, leader, err := s.sm.HealthCheck(ctx)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy", "error": err.Error()})
+		logrus.Errorf("health check failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy", "error": "service unavailable"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "healthy", "role": role.String(), "leader": leader})
@@ -92,7 +100,8 @@ func (s *Server) readyHandler(c *gin.Context) {
 	defer cancel()
 	role, leader, err := s.sm.HealthCheck(ctx)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "error": err.Error()})
+		logrus.Errorf("ready check failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "error": "service unavailable"})
 		return
 	}
 	// Node is ready if it is the leader, or if it knows who the leader is.
@@ -111,7 +120,7 @@ func (s *Server) getHandler(c *gin.Context) {
 	}
 	buf, err := s.sm.GetValue(c.Request.Context(), []byte(key))
 	if err != nil {
-		c.String(http.StatusInternalServerError, err.Error())
+		internalErrorString(c, err)
 		return
 	}
 	c.String(http.StatusOK, string(buf))
@@ -133,7 +142,7 @@ func (s *Server) postHandler(c *gin.Context) {
 	}
 	kvList := &konsen.KVList{KvList: kvs}
 	if err := s.sm.SetKeyValue(c.Request.Context(), kvList); err != nil {
-		c.String(http.StatusInternalServerError, err.Error())
+		internalErrorString(c, err)
 		return
 	}
 	c.String(http.StatusOK, "")
@@ -151,7 +160,7 @@ func (s *Server) apiGetHandler(c *gin.Context) {
 	defer cancel()
 	buf, err := s.sm.GetValue(ctx, []byte(key))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	if buf == nil {
@@ -180,7 +189,7 @@ func (s *Server) apiPutHandler(c *gin.Context) {
 		KvList: []*konsen.KV{{Key: []byte(body.Key), Value: []byte(body.Value)}},
 	}
 	if err := s.sm.SetKeyValue(ctx, kvList); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -193,6 +202,9 @@ func (s *Server) apiListKeysHandler(c *gin.Context) {
 	if err != nil || limit < 0 {
 		limit = 100
 	}
+	if limit > maxListKeysLimit {
+		limit = maxListKeysLimit
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -203,7 +215,7 @@ func (s *Server) apiListKeysHandler(c *gin.Context) {
 	}
 	keys, err := s.sm.ListKeys(ctx, prefixBytes, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	keyStrings := make([]string, len(keys))
@@ -217,22 +229,22 @@ func (s *Server) apiStatusHandler(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
 
-	snapshot, err := s.sm.GetSnapshot(ctx)
+	status, err := s.sm.GetStatus(ctx)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"node":          s.localServerName,
-		"role":          snapshot.Role.String(),
-		"currentLeader": snapshot.CurrentLeader,
-		"currentTerm":   snapshot.CurrentTerm,
-		"commitIndex":   snapshot.CommitIndex,
-		"lastApplied":   snapshot.LastApplied,
-		"nextIndex":     snapshot.NextIndex,
-		"matchIndex":    snapshot.MatchIndex,
-		"logCount":      len(snapshot.LogIndices),
+		"role":          status.Role.String(),
+		"currentLeader": status.CurrentLeader,
+		"currentTerm":   status.CurrentTerm,
+		"commitIndex":   status.CommitIndex,
+		"lastApplied":   status.LastApplied,
+		"nextIndex":     status.NextIndex,
+		"matchIndex":    status.MatchIndex,
+		"logCount":      status.LogCount,
 	})
 }
 
@@ -246,4 +258,23 @@ func (s *Server) Run() error {
 // Shutdown gracefully shuts down the server, allowing in-flight requests to complete.
 func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
+}
+
+func maxBodySizeMiddleware(maxSize int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxSize)
+		}
+		c.Next()
+	}
+}
+
+func internalError(c *gin.Context, err error) {
+	logrus.Errorf("internal error: %v", err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+}
+
+func internalErrorString(c *gin.Context, err error) {
+	logrus.Errorf("internal error: %v", err)
+	c.String(http.StatusInternalServerError, "internal server error")
 }
