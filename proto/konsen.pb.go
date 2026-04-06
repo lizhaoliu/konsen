@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.10
 // 	protoc        v5.28.3
-// source: konsen.proto
+// source: proto/konsen.proto
 
 package konsen
 
@@ -31,7 +31,7 @@ type KV struct {
 
 func (x *KV) Reset() {
 	*x = KV{}
-	mi := &file_konsen_proto_msgTypes[0]
+	mi := &file_proto_konsen_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -43,7 +43,7 @@ func (x *KV) String() string {
 func (*KV) ProtoMessage() {}
 
 func (x *KV) ProtoReflect() protoreflect.Message {
-	mi := &file_konsen_proto_msgTypes[0]
+	mi := &file_proto_konsen_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -56,7 +56,7 @@ func (x *KV) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KV.ProtoReflect.Descriptor instead.
 func (*KV) Descriptor() ([]byte, []int) {
-	return file_konsen_proto_rawDescGZIP(), []int{0}
+	return file_proto_konsen_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *KV) GetKey() []byte {
@@ -82,7 +82,7 @@ type KVList struct {
 
 func (x *KVList) Reset() {
 	*x = KVList{}
-	mi := &file_konsen_proto_msgTypes[1]
+	mi := &file_proto_konsen_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -94,7 +94,7 @@ func (x *KVList) String() string {
 func (*KVList) ProtoMessage() {}
 
 func (x *KVList) ProtoReflect() protoreflect.Message {
-	mi := &file_konsen_proto_msgTypes[1]
+	mi := &file_proto_konsen_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -107,7 +107,7 @@ func (x *KVList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KVList.ProtoReflect.Descriptor instead.
 func (*KVList) Descriptor() ([]byte, []int) {
-	return file_konsen_proto_rawDescGZIP(), []int{1}
+	return file_proto_konsen_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *KVList) GetKvList() []*KV {
@@ -117,11 +117,11 @@ func (x *KVList) GetKvList() []*KV {
 	return nil
 }
 
-var File_konsen_proto protoreflect.FileDescriptor
+var File_proto_konsen_proto protoreflect.FileDescriptor
 
-const file_konsen_proto_rawDesc = "" +
+const file_proto_konsen_proto_rawDesc = "" +
 	"\n" +
-	"\fkonsen.proto\x12\x06konsen\",\n" +
+	"\x12proto/konsen.proto\x12\x06konsen\",\n" +
 	"\x02KV\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"-\n" +
@@ -130,23 +130,23 @@ const file_konsen_proto_rawDesc = "" +
 	".konsen.KVR\x06kvListB\vZ\t./;konsenb\x06proto3"
 
 var (
-	file_konsen_proto_rawDescOnce sync.Once
-	file_konsen_proto_rawDescData []byte
+	file_proto_konsen_proto_rawDescOnce sync.Once
+	file_proto_konsen_proto_rawDescData []byte
 )
 
-func file_konsen_proto_rawDescGZIP() []byte {
-	file_konsen_proto_rawDescOnce.Do(func() {
-		file_konsen_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_konsen_proto_rawDesc), len(file_konsen_proto_rawDesc)))
+func file_proto_konsen_proto_rawDescGZIP() []byte {
+	file_proto_konsen_proto_rawDescOnce.Do(func() {
+		file_proto_konsen_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_konsen_proto_rawDesc), len(file_proto_konsen_proto_rawDesc)))
 	})
-	return file_konsen_proto_rawDescData
+	return file_proto_konsen_proto_rawDescData
 }
 
-var file_konsen_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
-var file_konsen_proto_goTypes = []any{
+var file_proto_konsen_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_proto_konsen_proto_goTypes = []any{
 	(*KV)(nil),     // 0: konsen.KV
 	(*KVList)(nil), // 1: konsen.KVList
 }
-var file_konsen_proto_depIdxs = []int32{
+var file_proto_konsen_proto_depIdxs = []int32{
 	0, // 0: konsen.KVList.kv_list:type_name -> konsen.KV
 	1, // [1:1] is the sub-list for method output_type
 	1, // [1:1] is the sub-list for method input_type
@@ -155,26 +155,26 @@ var file_konsen_proto_depIdxs = []int32{
 	0, // [0:1] is the sub-list for field type_name
 }
 
-func init() { file_konsen_proto_init() }
-func file_konsen_proto_init() {
-	if File_konsen_proto != nil {
+func init() { file_proto_konsen_proto_init() }
+func file_proto_konsen_proto_init() {
+	if File_proto_konsen_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_konsen_proto_rawDesc), len(file_konsen_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_konsen_proto_rawDesc), len(file_proto_konsen_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_konsen_proto_goTypes,
-		DependencyIndexes: file_konsen_proto_depIdxs,
-		MessageInfos:      file_konsen_proto_msgTypes,
+		GoTypes:           file_proto_konsen_proto_goTypes,
+		DependencyIndexes: file_proto_konsen_proto_depIdxs,
+		MessageInfos:      file_proto_konsen_proto_msgTypes,
 	}.Build()
-	File_konsen_proto = out.File
-	file_konsen_proto_goTypes = nil
-	file_konsen_proto_depIdxs = nil
+	File_proto_konsen_proto = out.File
+	file_proto_konsen_proto_goTypes = nil
+	file_proto_konsen_proto_depIdxs = nil
 }

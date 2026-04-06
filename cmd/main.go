@@ -46,11 +46,11 @@ func init() {
 	gin.SetMode(gin.ReleaseMode)
 }
 
-func createClients(cluster *core.ClusterConfig) (map[string]core.RaftService, error) {
-	clients := make(map[string]core.RaftService)
+func createClients(cluster *core.ClusterConfig) (map[string]*core.PeerClient, error) {
+	clients := make(map[string]*core.PeerClient)
 	for server, endpoint := range cluster.Servers {
 		if server != cluster.LocalServerName {
-			c, err := rpc.NewRaftGRPCClient(rpc.RaftGRPCClientConfig{
+			c, err := rpc.NewPeerGRPCClient(rpc.PeerGRPCClientConfig{
 				Endpoint: endpoint,
 			})
 			if err != nil {
@@ -62,7 +62,7 @@ func createClients(cluster *core.ClusterConfig) (map[string]core.RaftService, er
 	return clients, nil
 }
 
-func closeClients(clients map[string]core.RaftService) {
+func closeClients(clients map[string]*core.PeerClient) {
 	for server, client := range clients {
 		if err := client.Close(); err != nil {
 			logrus.Errorf("Failed to close client for %s: %v", server, err)

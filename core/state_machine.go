@@ -53,7 +53,7 @@ type StateMachine struct {
 
 	// ClusterConfig info.
 	cluster *ClusterConfig
-	clients map[string]RaftService
+	clients map[string]*PeerClient
 
 	wg   sync.WaitGroup
 	once sync.Once
@@ -73,7 +73,7 @@ type StateMachine struct {
 type StateMachineConfig struct {
 	Storage datastore.Storage      // Local storage instance.
 	Cluster *ClusterConfig         // Cluster configuration.
-	Clients map[string]RaftService // A map of "server name": "Raft service".
+	Clients map[string]*PeerClient // A map of "server name": peer client.
 
 	// Optional timeout overrides (zero values use defaults).
 	MinTimeout  time.Duration // Minimum election timeout.
@@ -121,10 +121,10 @@ type electionTimeoutMsg struct{}
 // appendEntriesMsg represents a message to send AppendEntries request to all nodes.
 type appendEntriesMsg struct{}
 
-// appendDataMsg represents a message to append given data into state machine.
-type appendDataMsg struct {
-	req *konsen.AppendDataReq
-	ch  chan<- *konsen.AppendDataResp
+// putMsg represents a message to write data into the state machine.
+type putMsg struct {
+	req *konsen.PutReq
+	ch  chan<- *konsen.PutResp
 }
 
 // getSnapshotMsg represents a message to generate a state snapshot.
@@ -602,7 +602,7 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 				defer sm.wg.Done()
 				rpcCtx, cancel := context.WithTimeout(ctx, defaultRequestTimeout)
 				defer cancel()
-				resp, err := sm.clients[server].RequestVote(rpcCtx, req)
+				resp, err := sm.clients[server].Raft.RequestVote(rpcCtx, req)
 				if err != nil {
 					log.Debugf("Failed to send RequestVote to %q(%q): %v", server, sm.cluster.Servers[server], err)
 					return // Don't send nil response to message loop
@@ -659,7 +659,7 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 				defer sm.wg.Done()
 				rpcCtx, cancel := context.WithTimeout(ctx, defaultRequestTimeout)
 				defer cancel()
-				resp, err := sm.clients[server].AppendEntries(rpcCtx, req)
+				resp, err := sm.clients[server].Raft.AppendEntries(rpcCtx, req)
 				if err != nil {
 					log.Debugf("Failed to send AppendEntries to %q(%q): %v", server, sm.cluster.Servers[server], err)
 					return
@@ -806,8 +806,8 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					if err := sm.sendAppendEntries(context.Background()); err != nil {
 						log.Fatalf("%v", err)
 					}
-				case appendDataMsg:
-					if err := sm.handleAppendData(v.req, v.ch); err != nil {
+				case putMsg:
+					if err := sm.handlePut(v.req, v.ch); err != nil {
 						log.Fatalf("%v", err)
 					}
 				case getSnapshotMsg:
@@ -817,8 +817,7 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					}
 					v.ch <- snapshot
 				case getValueMsg:
-					val, err := sm.handleGetValue(v.key)
-					v.ch <- getValueResp{value: val, err: err}
+					sm.handleGetValue(v.key, v.ch)
 				case registerCondMsg:
 					sm.condMap[v.logIndex] = v.condCh
 				case unregisterCondMsg:
@@ -913,11 +912,11 @@ func (sm *StateMachine) nextTimeout() time.Duration {
 	return time.Duration(timeout)
 }
 
-// AppendData stores the given data into state machine, and it returns after the data is replicated onto quorum.
-func (sm *StateMachine) AppendData(ctx context.Context, req *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
-	ch := make(chan *konsen.AppendDataResp, 1) // Buffered to prevent blocking message loop if caller times out
+// Put stores the given data into state machine, and it returns after the data is replicated onto quorum.
+func (sm *StateMachine) Put(ctx context.Context, req *konsen.PutReq) (*konsen.PutResp, error) {
+	ch := make(chan *konsen.PutResp, 1) // Buffered to prevent blocking message loop if caller times out
 	select {
-	case sm.msgCh <- appendDataMsg{req: req, ch: ch}:
+	case sm.msgCh <- putMsg{req: req, ch: ch}:
 	case <-sm.stopCh:
 		return nil, fmt.Errorf("server has been shut down")
 	case <-ctx.Done():
@@ -938,14 +937,14 @@ func (sm *StateMachine) majority() int {
 	return len(sm.cluster.Servers)/2 + 1
 }
 
-// handleAppendData processes a appendDataMsg, it writes the data into local (or on leader's) logs, returns after the
+// handlePut processes a putMsg, it writes the data into local (or on leader's) logs, returns after the
 // data is applied to local state machine.
 // The message loop goroutine should NEVER block in this method since it depends on subsequent AppendEntriesResp in
 // order to determine which log is committed, otherwise it will deadlock.
-func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) error {
+func (sm *StateMachine) handlePut(req *konsen.PutReq, ch chan<- *konsen.PutResp) error {
 	// If no leader is elected, put the message back to message queue.
 	if sm.currentLeader == "" {
-		ch <- &konsen.AppendDataResp{
+		ch <- &konsen.PutResp{
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("no leader is elected yet (are there more than %d nodes down?)", sm.majority()-1),
 		}
@@ -956,7 +955,7 @@ func (sm *StateMachine) handleAppendData(req *konsen.AppendDataReq, ch chan<- *k
 	if sm.getRole() != konsen.Role_LEADER {
 		// Forward the request to leader.
 		// Capture currentLeader before spawning goroutine to avoid data race.
-		sm.forwardRequestToLeader(sm.currentLeader, req, ch)
+		sm.forwardPutToLeader(sm.currentLeader, req, ch)
 		return nil
 	}
 
@@ -992,18 +991,18 @@ func (sm *StateMachine) writeToLogs(data []byte) (*konsen.Log, error) {
 	return newLog, nil
 }
 
-// forwardRequestToLeader starts a new goroutine to send request to current leader, and the goroutine replies after receiving result from leader.
+// forwardPutToLeader starts a new goroutine to send a Put request to the current leader, and the goroutine replies after receiving result from leader.
 // The leader parameter is captured before spawning the goroutine to avoid data race on sm.currentLeader.
-func (sm *StateMachine) forwardRequestToLeader(leader string, req *konsen.AppendDataReq, ch chan<- *konsen.AppendDataResp) {
+func (sm *StateMachine) forwardPutToLeader(leader string, req *konsen.PutReq, ch chan<- *konsen.PutResp) {
 	sm.wg.Add(1)
 	go func() {
 		defer sm.wg.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
 		defer cancel()
-		resp, err := sm.clients[leader].AppendData(ctx, req)
+		resp, err := sm.clients[leader].KV.Put(ctx, req)
 		if err != nil {
-			log.Debugf("Failed to send AppendDataReq to leader %q: %v", leader, err)
-			ch <- &konsen.AppendDataResp{Success: false, ErrorMessage: err.Error()}
+			log.Debugf("Failed to send PutReq to leader %q: %v", leader, err)
+			ch <- &konsen.PutResp{Success: false, ErrorMessage: err.Error()}
 			return
 		}
 		ch <- resp
@@ -1012,7 +1011,7 @@ func (sm *StateMachine) forwardRequestToLeader(leader string, req *konsen.Append
 
 // replyWhenLogApplied starts a new goroutine to reply request after new log is applied to local state machine.
 // This method is called from the message loop, so we can directly access condMap.
-func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.AppendDataResp) {
+func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.PutResp) {
 	condCh := make(chan struct{})
 	// Register the condition channel directly - we're in the message loop
 	sm.condMap[logIndex] = condCh
@@ -1033,7 +1032,7 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 			case <-sm.stopCh:
 			}
 			log.Debugf("Log[%d] is committed and applied on local state machine.", logIndex)
-			ch <- &konsen.AppendDataResp{Success: true}
+			ch <- &konsen.PutResp{Success: true}
 		case <-timer.C:
 			// Unregister via message to maintain actor pattern
 			select {
@@ -1041,7 +1040,7 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 			case <-sm.stopCh:
 			}
 			log.Debugf("Timeout while waiting for log[%d] to be committed and applied.", logIndex)
-			ch <- &konsen.AppendDataResp{
+			ch <- &konsen.PutResp{
 				Success:      false,
 				ErrorMessage: fmt.Sprintf("failed to replicate onto quorum and apply commands (are there more than %d nodes down?)", sm.majority()-1),
 			}
@@ -1051,7 +1050,7 @@ func (sm *StateMachine) replyWhenLogApplied(logIndex uint64, ch chan<- *konsen.A
 			case sm.msgCh <- unregisterCondMsg{logIndex: logIndex}:
 			default: // Non-blocking - msgCh might be closed or full during shutdown
 			}
-			ch <- &konsen.AppendDataResp{
+			ch <- &konsen.PutResp{
 				Success:      false,
 				ErrorMessage: "server has been shut down",
 			}
@@ -1139,7 +1138,7 @@ func (sm *StateMachine) SetKeyValue(ctx context.Context, kv *konsen.KVList) erro
 	if err != nil {
 		return fmt.Errorf("failed to marshal: %v", err)
 	}
-	resp, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: buf})
+	resp, err := sm.Put(ctx, &konsen.PutReq{Data: buf})
 	if err != nil {
 		return err
 	}
@@ -1166,14 +1165,38 @@ func (sm *StateMachine) GetValue(ctx context.Context, key []byte) ([]byte, error
 	}
 }
 
-func (sm *StateMachine) handleGetValue(key []byte) ([]byte, error) {
+func (sm *StateMachine) handleGetValue(key []byte, ch chan<- getValueResp) {
 	if sm.getRole() != konsen.Role_LEADER {
 		if sm.currentLeader == "" {
-			return nil, fmt.Errorf("no leader is elected yet")
+			ch <- getValueResp{err: fmt.Errorf("no leader is elected yet")}
+			return
 		}
-		return nil, fmt.Errorf("not the leader; current leader is %q", sm.currentLeader)
+		sm.forwardGetToLeader(sm.currentLeader, key, ch)
+		return
 	}
-	return sm.storage.GetValue(key)
+	val, err := sm.storage.GetValue(key)
+	ch <- getValueResp{value: val, err: err}
+}
+
+// forwardGetToLeader starts a new goroutine to send a Get request to the current leader.
+// The leader parameter is captured before spawning the goroutine to avoid data race on sm.currentLeader.
+func (sm *StateMachine) forwardGetToLeader(leader string, key []byte, ch chan<- getValueResp) {
+	sm.wg.Add(1)
+	go func() {
+		defer sm.wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+		defer cancel()
+		resp, err := sm.clients[leader].KV.Get(ctx, &konsen.GetReq{Key: key})
+		if err != nil {
+			ch <- getValueResp{err: err}
+			return
+		}
+		if !resp.GetSuccess() {
+			ch <- getValueResp{err: fmt.Errorf("%s", resp.GetErrorMessage())}
+			return
+		}
+		ch <- getValueResp{value: resp.GetValue()}
+	}()
 }
 
 func (sm *StateMachine) Close() error {

@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.0
 // - protoc             v5.28.3
-// source: raft.proto
+// source: proto/raft.proto
 
 package konsen
 
@@ -21,7 +21,6 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Raft_AppendEntries_FullMethodName = "/konsen.Raft/AppendEntries"
 	Raft_RequestVote_FullMethodName   = "/konsen.Raft/RequestVote"
-	Raft_AppendData_FullMethodName    = "/konsen.Raft/AppendData"
 )
 
 // RaftClient is the client API for Raft service.
@@ -32,8 +31,6 @@ type RaftClient interface {
 	AppendEntries(ctx context.Context, in *AppendEntriesReq, opts ...grpc.CallOption) (*AppendEntriesResp, error)
 	// Sends "RequestVote" request.
 	RequestVote(ctx context.Context, in *RequestVoteReq, opts ...grpc.CallOption) (*RequestVoteResp, error)
-	// Sends "AppendData" request.
-	AppendData(ctx context.Context, in *AppendDataReq, opts ...grpc.CallOption) (*AppendDataResp, error)
 }
 
 type raftClient struct {
@@ -64,16 +61,6 @@ func (c *raftClient) RequestVote(ctx context.Context, in *RequestVoteReq, opts .
 	return out, nil
 }
 
-func (c *raftClient) AppendData(ctx context.Context, in *AppendDataReq, opts ...grpc.CallOption) (*AppendDataResp, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(AppendDataResp)
-	err := c.cc.Invoke(ctx, Raft_AppendData_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // RaftServer is the server API for Raft service.
 // All implementations must embed UnimplementedRaftServer
 // for forward compatibility.
@@ -82,8 +69,6 @@ type RaftServer interface {
 	AppendEntries(context.Context, *AppendEntriesReq) (*AppendEntriesResp, error)
 	// Sends "RequestVote" request.
 	RequestVote(context.Context, *RequestVoteReq) (*RequestVoteResp, error)
-	// Sends "AppendData" request.
-	AppendData(context.Context, *AppendDataReq) (*AppendDataResp, error)
 	mustEmbedUnimplementedRaftServer()
 }
 
@@ -99,9 +84,6 @@ func (UnimplementedRaftServer) AppendEntries(context.Context, *AppendEntriesReq)
 }
 func (UnimplementedRaftServer) RequestVote(context.Context, *RequestVoteReq) (*RequestVoteResp, error) {
 	return nil, status.Error(codes.Unimplemented, "method RequestVote not implemented")
-}
-func (UnimplementedRaftServer) AppendData(context.Context, *AppendDataReq) (*AppendDataResp, error) {
-	return nil, status.Error(codes.Unimplemented, "method AppendData not implemented")
 }
 func (UnimplementedRaftServer) mustEmbedUnimplementedRaftServer() {}
 func (UnimplementedRaftServer) testEmbeddedByValue()              {}
@@ -160,24 +142,6 @@ func _Raft_RequestVote_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Raft_AppendData_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(AppendDataReq)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RaftServer).AppendData(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Raft_AppendData_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RaftServer).AppendData(ctx, req.(*AppendDataReq))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // Raft_ServiceDesc is the grpc.ServiceDesc for Raft service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -193,11 +157,7 @@ var Raft_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "RequestVote",
 			Handler:    _Raft_RequestVote_Handler,
 		},
-		{
-			MethodName: "AppendData",
-			Handler:    _Raft_AppendData_Handler,
-		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "raft.proto",
+	Metadata: "proto/raft.proto",
 }

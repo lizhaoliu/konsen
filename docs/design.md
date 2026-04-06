@@ -42,7 +42,7 @@ Clients interact with the cluster over HTTP. Internally, nodes communicate via g
 |---|---|---|
 | StateMachine | `core/` | Raft consensus logic, leader election, log replication, log application |
 | Storage | `datastore/` | Persistent state (term, votedFor, logs) and KV data |
-| gRPC Transport | `rpc/` | Inter-node Raft RPCs (AppendEntries, RequestVote, AppendData) |
+| gRPC Transport | `rpc/` | Inter-node Raft RPCs (AppendEntries, RequestVote) and KV RPCs (Put, Get) |
 | HTTP Server | `web/httpserver/` | Client-facing REST API for reads and writes |
 | Proto Definitions | `proto/` | Protocol Buffer message and service definitions |
 | Bootstrap | `cmd/` | Server initialization and graceful shutdown |
@@ -107,9 +107,9 @@ Every node maintains the following state, matching Raft Figure 2:
 
 ### 3.4 Follower Request Forwarding
 
-When a non-leader node receives a client write, it forwards the `AppendData` RPC to the current leader via gRPC and relays the response back to the client.
+When a non-leader node receives a client write, it forwards the `Put` RPC to the current leader via the `KVService` gRPC service and relays the response back to the client.
 
-Read requests (`GetValue`) are only served by the leader and return an error on followers, indicating who the current leader is.
+Read requests (`Get`) are also forwarded to the leader when received by a follower, ensuring linearizable reads regardless of which node the client contacts.
 
 ## 4. Concurrency Model: Actor Pattern
 
@@ -139,8 +139,8 @@ External callers (gRPC handlers, HTTP handlers) submit typed messages to `msgCh`
 | `appendEntriesRespWrap` | RPC goroutine | Response to an AppendEntries we sent |
 | `requestVoteWrap` | gRPC server | Incoming RequestVote from a candidate |
 | `*RequestVoteResp` | RPC goroutine | Response to a RequestVote we sent |
-| `appendDataMsg` | gRPC/HTTP | Client write request |
-| `getValueMsg` | HTTP | Client read request |
+| `putMsg` | gRPC/HTTP | Client write request |
+| `getValueMsg` | gRPC/HTTP | Client read request |
 | `electionTimeoutMsg` | Election loop | Election timer expired |
 | `appendEntriesMsg` | Heartbeat loop | Time to send heartbeats |
 | `registerCondMsg` | Message loop | Register a waiter for log application |
@@ -163,10 +163,10 @@ The state machine runs three long-lived goroutines:
 Client POST /konsen ──> HTTP Server
                             │
                             ▼
-                     SetKeyValue() ──marshal KVList──> AppendData()
+                     SetKeyValue() ──marshal KVList──> Put()
                             │
                             ▼
-                     msgCh ──> Message Loop: handleAppendData()
+                     msgCh ──> Message Loop: handlePut()
                             │
                     ┌───────┴────────────────────┐
                     │ Follower?                   │ Leader?
@@ -233,42 +233,55 @@ type Storage interface {
 
 ## 6. gRPC Transport
 
-### Protocol Buffers (`proto/raft.proto`)
+### Protocol Buffers
 
-Defines the `Raft` gRPC service with three RPCs:
+Two gRPC services are defined across separate proto files:
+
+**`proto/raft.proto`** -- The Raft consensus service with two RPCs:
 
 ```protobuf
 service Raft {
   rpc AppendEntries(AppendEntriesReq) returns (AppendEntriesResp);
   rpc RequestVote(RequestVoteReq)     returns (RequestVoteResp);
-  rpc AppendData(AppendDataReq)       returns (AppendDataResp);
 }
 ```
 
-`AppendEntries` and `RequestVote` are the two core Raft RPCs. `AppendData` is an extension that allows any node to accept client writes and forward them to the leader.
+**`proto/kv.proto`** -- The application-level KV service:
+
+```protobuf
+service KVService {
+  rpc Put(PutReq) returns (PutResp);
+  rpc Get(GetReq) returns (GetResp);
+}
+```
+
+`AppendEntries` and `RequestVote` are the two core Raft RPCs. `Put` and `Get` are application-level RPCs that allow any node to accept client reads/writes and forward them to the leader.
 
 A separate `konsen.proto` defines `KV` and `KVList` messages used as the log entry payload format.
 
-### RaftService Interface (`core/raft_service.go`)
+### Service Interfaces (`core/raft_service.go`, `core/kv_service.go`)
 
 ```go
 type RaftService interface {
     AppendEntries(ctx context.Context, in *AppendEntriesReq) (*AppendEntriesResp, error)
     RequestVote(ctx context.Context, in *RequestVoteReq) (*RequestVoteResp, error)
-    AppendData(ctx context.Context, in *AppendDataReq) (*AppendDataResp, error)
-    Close() error
+}
+
+type KVService interface {
+    Put(ctx context.Context, in *PutReq) (*PutResp, error)
+    Get(ctx context.Context, in *GetReq) (*GetResp, error)
 }
 ```
 
-This interface decouples the state machine from the transport. The `StateMachine` holds a `map[string]RaftService` of clients -- one per remote node. This makes it possible to swap transport implementations or inject mocks for testing.
+These interfaces decouple the state machine from the transport. The `StateMachine` holds a `map[string]*PeerClient` of clients -- one per remote node. Each `PeerClient` groups a `RaftService` and `KVService` over a shared connection. This makes it possible to swap transport implementations or inject mocks for testing.
 
 ### gRPC Server (`rpc/grpc_server.go`)
 
-Wraps the `StateMachine` and implements the generated `RaftServer` interface. Each incoming RPC is forwarded to the corresponding `StateMachine` method with a 10-second timeout.
+Wraps the `StateMachine` and implements both the `RaftServer` and `KVServiceServer` gRPC interfaces. Each incoming RPC is forwarded to the corresponding `StateMachine` method with a 10-second timeout.
 
 ### gRPC Client (`rpc/grpc_client.go`)
 
-Uses `grpc.NewClient` for lazy connection establishment -- the connection is created on the first RPC call, not at client creation time. `WaitForReady(false)` is set on all calls to fail fast when a node is unreachable rather than blocking. gRPC keepalive is enabled for connection health checking.
+Implements both `RaftService` and `KVService` over a single shared gRPC connection, returned as a `PeerClient`. Uses `grpc.NewClient` for lazy connection establishment -- the connection is created on the first RPC call, not at client creation time. `WaitForReady(false)` is set on all calls to fail fast when a node is unreachable rather than blocking. gRPC keepalive is enabled for connection health checking.
 
 ## 7. HTTP API
 
@@ -276,7 +289,7 @@ The HTTP layer (`web/httpserver/server.go`) uses the Gin framework and exposes t
 
 ### `GET /konsen?key=<key>`
 
-Read a value. Only succeeds on the leader -- followers return an error indicating the current leader. This provides linearizable reads (the leader has the most up-to-date committed state).
+Read a value. If the request reaches a follower, it is automatically forwarded to the current leader. This provides linearizable reads (the leader has the most up-to-date committed state) while allowing clients to contact any node.
 
 ### `POST /konsen`
 
@@ -354,6 +367,7 @@ konsen/
   core/
     state_machine.go            # Raft state machine (actor model, ~1120 lines)
     raft_service.go             # RaftService interface definition
+    kv_service.go               # KVService interface and PeerClient definition
     cluster.go                  # Cluster configuration parsing and validation
   datastore/
     storage.go                  # Storage interface
@@ -361,12 +375,13 @@ konsen/
     boltdb_storage.go           # BoltDB implementation (alternative)
     utils.go                    # Encoding helpers and key constants
   proto/
-    raft.proto                  # Raft RPC message and service definitions
-    konsen.proto                # KV store payload definitions
+    raft.proto                  # Raft consensus RPC definitions (AppendEntries, RequestVote)
+    kv.proto                    # KV application RPC definitions (Put, Get)
+    konsen.proto                # KV store payload definitions (KV, KVList)
     *.pb.go / *_grpc.pb.go      # Generated Go code
   rpc/
-    grpc_server.go              # gRPC server wrapping StateMachine
-    grpc_client.go              # gRPC client implementing RaftService
+    grpc_server.go              # gRPC server wrapping StateMachine (Raft + KV services)
+    grpc_client.go              # gRPC client implementing RaftService and KVService
   web/httpserver/
     server.go                   # HTTP REST API (Gin)
   conf/
@@ -381,5 +396,4 @@ konsen/
 - **No cluster membership changes:** The cluster size is fixed at startup. Dynamic reconfiguration (Section 6 of the paper) is not supported.
 - **No TLS:** gRPC connections use insecure credentials.
 - **No unit tests:** Correctness relies on manual/integration testing.
-- **Leader-only reads:** Read requests are rejected on followers rather than forwarded.
 - **No client request deduplication:** Retried writes could result in duplicate log entries.

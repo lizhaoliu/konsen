@@ -25,7 +25,8 @@ const (
 	testHeartbeat   = 30 * time.Millisecond
 )
 
-// inProcessClient implements core.RaftService by forwarding calls to a StateMachine directly.
+// inProcessClient implements both core.RaftService and core.KVService
+// by forwarding calls to a StateMachine directly.
 type inProcessClient struct {
 	mu       sync.RWMutex
 	target   *core.StateMachine
@@ -109,15 +110,25 @@ func (c *inProcessClient) RequestVote(ctx context.Context, in *konsen.RequestVot
 	return target.RequestVote(ctx, in)
 }
 
-func (c *inProcessClient) AppendData(ctx context.Context, in *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
+func (c *inProcessClient) Put(ctx context.Context, in *konsen.PutReq) (*konsen.PutResp, error) {
 	target, err := c.simulateNetwork(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return target.AppendData(ctx, in)
+	return target.Put(ctx, in)
 }
 
-func (c *inProcessClient) Close() error { return nil }
+func (c *inProcessClient) Get(ctx context.Context, in *konsen.GetReq) (*konsen.GetResp, error) {
+	target, err := c.simulateNetwork(ctx)
+	if err != nil {
+		return nil, err
+	}
+	val, err := target.GetValue(ctx, in.GetKey())
+	if err != nil {
+		return &konsen.GetResp{Success: false, ErrorMessage: err.Error()}, nil
+	}
+	return &konsen.GetResp{Success: true, Value: val}, nil
+}
 
 // testCluster manages an in-process Raft cluster for integration testing.
 type testCluster struct {
@@ -163,7 +174,7 @@ func newTestCluster(t *testing.T, nodeNames []string) *testCluster {
 			Servers:         servers,
 			LocalServerName: name,
 		}
-		clientMap := make(map[string]core.RaftService)
+		clientMap := make(map[string]*core.PeerClient)
 		inProcClients := make(map[string]*inProcessClient)
 
 		// Create placeholder clients - we'll set targets after all SMs exist.
@@ -171,7 +182,7 @@ func newTestCluster(t *testing.T, nodeNames []string) *testCluster {
 			if peer != name {
 				ipc := &inProcessClient{}
 				inProcClients[peer] = ipc
-				clientMap[peer] = ipc
+				clientMap[peer] = &core.PeerClient{Raft: ipc, KV: ipc}
 			}
 		}
 		tc.clients[name] = inProcClients
@@ -322,12 +333,12 @@ func (tc *testCluster) appendKV(leader string, key, value string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	resp, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: data})
+	resp, err := sm.Put(ctx, &konsen.PutReq{Data: data})
 	if err != nil {
 		return err
 	}
 	if !resp.GetSuccess() {
-		return fmt.Errorf("AppendData failed: %s", resp.GetErrorMessage())
+		return fmt.Errorf("Put failed: %s", resp.GetErrorMessage())
 	}
 	return nil
 }
