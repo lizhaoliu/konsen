@@ -5,6 +5,7 @@ metadata:
   namespace: konsen
 spec:
   serviceName: konsen-headless
+  podManagementPolicy: Parallel
   replicas: 3
   selector:
     matchLabels:
@@ -42,8 +43,8 @@ spec:
               mountPath: /etc/konsen
       containers:
         - name: konsen
-          image: konsen:latest
-          imagePullPolicy: IfNotPresent
+          image: <registry>/konsen:latest
+          imagePullPolicy: Always
           args:
             - "--cluster_config_path=/etc/konsen/cluster.yml"
             - "--db_dir=/data/db"

@@ -109,9 +109,17 @@ The HTTP API is available at `localhost:20001`, `localhost:20002`, and `localhos
 
 Deploys a 3-node StatefulSet with stable DNS identities and persistent storage. An init container injects each pod's name as `localServerName`, so a single ConfigMap covers all nodes.
 
+Two manifest settings are critical for Raft bootstrapping:
+
+- **`podManagementPolicy: Parallel`** (StatefulSet) — all pods must start simultaneously so the cluster can form a quorum and elect a leader. The default `OrderedReady` policy would deadlock because each pod waits for the previous one to become ready.
+- **`publishNotReadyAddresses: true`** (headless Service) — pods must resolve each other's DNS names before they're ready, otherwise they can't communicate to hold an election.
+
 ```bash
-# Build and import the image on your k3s node(s)
-docker build -t konsen:latest .
+# Build and push the image to your container registry
+docker build -t <registry>/konsen:latest .
+docker push <registry>/konsen:latest
+
+# Update the image field in conf/k8s/statefulset.yml to match
 
 # Apply manifests
 kubectl apply -f conf/k8s/namespace.yml

@@ -7,6 +7,7 @@ metadata:
     app: konsen
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app: konsen
   ports:
