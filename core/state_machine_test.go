@@ -18,11 +18,9 @@ type mockRaftService struct {
 
 	appendEntriesFunc func(ctx context.Context, in *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error)
 	requestVoteFunc   func(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error)
-	appendDataFunc    func(ctx context.Context, in *konsen.AppendDataReq) (*konsen.AppendDataResp, error)
 
 	appendEntriesCalls []*konsen.AppendEntriesReq
 	requestVoteCalls   []*konsen.RequestVoteReq
-	appendDataCalls    []*konsen.AppendDataReq
 }
 
 func newMockRaftService() *mockRaftService {
@@ -32,9 +30,6 @@ func newMockRaftService() *mockRaftService {
 		},
 		requestVoteFunc: func(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
 			return &konsen.RequestVoteResp{Term: in.GetTerm(), VoteGranted: true}, nil
-		},
-		appendDataFunc: func(ctx context.Context, in *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
-			return &konsen.AppendDataResp{Success: true}, nil
 		},
 	}
 }
@@ -55,15 +50,43 @@ func (m *mockRaftService) RequestVote(ctx context.Context, in *konsen.RequestVot
 	return fn(ctx, in)
 }
 
-func (m *mockRaftService) AppendData(ctx context.Context, in *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
+// mockKVService is a test double for KVService.
+type mockKVService struct {
+	mu sync.Mutex
+
+	putFunc func(ctx context.Context, in *konsen.PutReq) (*konsen.PutResp, error)
+	getFunc func(ctx context.Context, in *konsen.GetReq) (*konsen.GetResp, error)
+
+	putCalls []*konsen.PutReq
+	getCalls []*konsen.GetReq
+}
+
+func newMockKVService() *mockKVService {
+	return &mockKVService{
+		putFunc: func(ctx context.Context, in *konsen.PutReq) (*konsen.PutResp, error) {
+			return &konsen.PutResp{Success: true}, nil
+		},
+		getFunc: func(ctx context.Context, in *konsen.GetReq) (*konsen.GetResp, error) {
+			return &konsen.GetResp{Success: true}, nil
+		},
+	}
+}
+
+func (m *mockKVService) Put(ctx context.Context, in *konsen.PutReq) (*konsen.PutResp, error) {
 	m.mu.Lock()
-	m.appendDataCalls = append(m.appendDataCalls, in)
-	fn := m.appendDataFunc
+	m.putCalls = append(m.putCalls, in)
+	fn := m.putFunc
 	m.mu.Unlock()
 	return fn(ctx, in)
 }
 
-func (m *mockRaftService) Close() error { return nil }
+func (m *mockKVService) Get(ctx context.Context, in *konsen.GetReq) (*konsen.GetResp, error) {
+	m.mu.Lock()
+	m.getCalls = append(m.getCalls, in)
+	fn := m.getFunc
+	m.mu.Unlock()
+	return fn(ctx, in)
+}
 
 // makeTestCluster creates a 3-node cluster config for testing.
 func makeTestCluster(localName string) *ClusterConfig {
@@ -97,12 +120,15 @@ func makeTestSMWithConfig(t *testing.T, localName string, override StateMachineC
 	cluster := makeTestCluster(localName)
 
 	mocks := make(map[string]*mockRaftService)
-	clients := make(map[string]RaftService)
+	clients := make(map[string]*PeerClient)
 	for name := range cluster.Servers {
 		if name != localName {
 			m := newMockRaftService()
 			mocks[name] = m
-			clients[name] = m
+			clients[name] = &PeerClient{
+				Raft: m,
+				KV:   newMockKVService(),
+			}
 		}
 	}
 
@@ -142,7 +168,7 @@ func TestNewStateMachine_EvenNodes(t *testing.T) {
 			Servers:         map[string]string{"n1": "a", "n2": "b"},
 			LocalServerName: "n1",
 		},
-		Clients: map[string]RaftService{},
+		Clients: map[string]*PeerClient{},
 	})
 	if err == nil {
 		t.Fatal("expected error for even number of nodes")
@@ -615,7 +641,7 @@ func TestElectionTimeout_BecomesLeader(t *testing.T) {
 	t.Errorf("role = %v, want LEADER after winning election", sm.getRole())
 }
 
-func TestAppendData_NoLeader(t *testing.T) {
+func TestPut_NoLeader(t *testing.T) {
 	sm, _, cancel := makeTestSM(t, "node1")
 	defer stopSM(sm, cancel)
 
@@ -623,9 +649,9 @@ func TestAppendData_NoLeader(t *testing.T) {
 	defer c()
 
 	// No leader elected yet; directly inject data request while still a follower.
-	resp, err := sm.AppendData(ctx, &konsen.AppendDataReq{Data: []byte("test")})
+	resp, err := sm.Put(ctx, &konsen.PutReq{Data: []byte("test")})
 	if err != nil {
-		t.Fatalf("AppendData: %v", err)
+		t.Fatalf("Put: %v", err)
 	}
 	if resp.GetSuccess() {
 		t.Error("expected failure when no leader")

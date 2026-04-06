@@ -3,22 +3,26 @@ package rpc
 import (
 	"context"
 
+	"github.com/lizhaoliu/konsen/v2/core"
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
 
-type RaftGRPCClient struct {
-	conn   *grpc.ClientConn
-	client konsen.RaftClient
+// peerGRPCClient implements both core.RaftService and core.KVService
+// over a single shared gRPC connection.
+type peerGRPCClient struct {
+	conn       *grpc.ClientConn
+	raftClient konsen.RaftClient
+	kvClient   konsen.KVServiceClient
 }
 
-type RaftGRPCClientConfig struct {
+type PeerGRPCClientConfig struct {
 	Endpoint string
 }
 
-func NewRaftGRPCClient(config RaftGRPCClientConfig) (*RaftGRPCClient, error) {
+func NewPeerGRPCClient(config PeerGRPCClientConfig) (*core.PeerClient, error) {
 	// grpc.NewClient creates a lazy connection - it connects on first RPC call.
 	// Connection failures are handled via WaitForReady(false) on each RPC and
 	// the context timeout passed to each call.
@@ -31,25 +35,40 @@ func NewRaftGRPCClient(config RaftGRPCClientConfig) (*RaftGRPCClient, error) {
 		return nil, err
 	}
 
-	client := konsen.NewRaftClient(conn)
-	return &RaftGRPCClient{
-		conn:   conn,
-		client: client,
+	c := &peerGRPCClient{
+		conn:       conn,
+		raftClient: konsen.NewRaftClient(conn),
+		kvClient:   konsen.NewKVServiceClient(conn),
+	}
+	return &core.PeerClient{
+		Raft:   c,
+		KV:     c,
+		Closer: c,
 	}, nil
 }
 
-func (c *RaftGRPCClient) AppendEntries(ctx context.Context, in *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
-	return c.client.AppendEntries(ctx, in, grpc.WaitForReady(false))
+// RaftService implementation.
+
+func (c *peerGRPCClient) AppendEntries(ctx context.Context, in *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
+	return c.raftClient.AppendEntries(ctx, in, grpc.WaitForReady(false))
 }
 
-func (c *RaftGRPCClient) RequestVote(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
-	return c.client.RequestVote(ctx, in, grpc.WaitForReady(false))
+func (c *peerGRPCClient) RequestVote(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
+	return c.raftClient.RequestVote(ctx, in, grpc.WaitForReady(false))
 }
 
-func (c *RaftGRPCClient) AppendData(ctx context.Context, in *konsen.AppendDataReq) (*konsen.AppendDataResp, error) {
-	return c.client.AppendData(ctx, in, grpc.WaitForReady(false))
+// KVService implementation.
+
+func (c *peerGRPCClient) Put(ctx context.Context, in *konsen.PutReq) (*konsen.PutResp, error) {
+	return c.kvClient.Put(ctx, in, grpc.WaitForReady(false))
 }
 
-func (c *RaftGRPCClient) Close() error {
+func (c *peerGRPCClient) Get(ctx context.Context, in *konsen.GetReq) (*konsen.GetResp, error) {
+	return c.kvClient.Get(ctx, in, grpc.WaitForReady(false))
+}
+
+// Close closes the shared gRPC connection.
+
+func (c *peerGRPCClient) Close() error {
 	return c.conn.Close()
 }

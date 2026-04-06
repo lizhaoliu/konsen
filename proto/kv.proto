@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package konsen;
+
+option go_package = "./;konsen";
+
+message PutReq {
+  bytes data = 1; // Raw data/command to be stored and applied to the state machine.
+}
+
+message PutResp {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message GetReq {
+  bytes key = 1;
+}
+
+message GetResp {
+  bool success = 1;
+  bytes value = 2;
+  string error_message = 3;
+}
+
+service KVService {
+  // Writes data into the replicated log (forwarded to leader if necessary).
+  rpc Put(PutReq) returns (PutResp) {}
+
+  // Reads a value by key (forwarded to leader if necessary).
+  rpc Get(GetReq) returns (GetResp) {}
+}

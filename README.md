@@ -38,11 +38,11 @@ storage, _ := datastore.NewBadger(datastore.BadgerConfig{
 defer storage.Close()
 
 // Create gRPC clients to remote nodes.
-clients := make(map[string]core.RaftService)
+clients := make(map[string]*core.PeerClient)
 for name, endpoint := range cluster.Servers {
     if name != cluster.LocalServerName {
-        clients[name], _ = rpc.NewRaftGRPCClient(
-            rpc.RaftGRPCClientConfig{Endpoint: endpoint},
+        clients[name], _ = rpc.NewPeerGRPCClient(
+            rpc.PeerGRPCClientConfig{Endpoint: endpoint},
         )
     }
 }
@@ -67,7 +67,7 @@ sm.SetKeyValue(ctx, &konsen.KVList{
     },
 })
 
-// Read a value (leader-only; followers reject reads).
+// Read a value (forwarded to the leader if this node is a follower).
 value, _ := sm.GetValue(ctx, []byte("key"))
 ```
 
@@ -235,7 +235,7 @@ Latencies     [mean, 50, 95, 99, max]    82.19ms, 79.21ms, 113.41ms, 126.34ms, 1
 Success       [ratio]                    100.00%
 ```
 
-**Read** — all reads served by the leader:
+**Read** — reads are forwarded to the leader (clients can contact any node):
 
 ```text
 Requests      [total, rate, throughput]  50000, 9994.47, 9990.42

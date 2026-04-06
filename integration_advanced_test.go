@@ -213,7 +213,7 @@ func (tc *testCluster) restartNode(name string) error {
 	tc.mu.Unlock()
 
 	// Phase 2: create new SM and clients without holding the lock.
-	clientMap := make(map[string]core.RaftService)
+	clientMap := make(map[string]*core.PeerClient)
 	inProcClients := make(map[string]*inProcessClient)
 	for peer, pi := range peers {
 		ipc := &inProcessClient{target: pi.target}
@@ -223,7 +223,7 @@ func (tc *testCluster) restartNode(name string) error {
 		ipc.delay = pi.delay
 		ipc.dropRate = pi.dropRate
 		inProcClients[peer] = ipc
-		clientMap[peer] = ipc
+		clientMap[peer] = &core.PeerClient{Raft: ipc, KV: ipc}
 	}
 
 	sm, err := core.NewStateMachine(core.StateMachineConfig{
