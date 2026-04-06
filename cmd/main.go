@@ -109,8 +109,9 @@ func main() {
 	})
 
 	httpSrv := httpserver.NewServer(httpserver.ServerConfig{
-		StateMachine: sm,
-		Address:      cluster.HttpServers[cluster.LocalServerName],
+		StateMachine:    sm,
+		Address:         cluster.HttpServers[cluster.LocalServerName],
+		LocalServerName: cluster.LocalServerName,
 	})
 
 	go func() {
