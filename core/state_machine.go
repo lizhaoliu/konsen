@@ -336,6 +336,7 @@ func (sm *StateMachine) maybeBecomeFollower(term uint64) (uint64, error) {
 		currentTerm = term
 		sm.stopHeartbeatIfRunning()
 		sm.setRole(konsen.Role_FOLLOWER)
+		sm.numVotes = 0
 		// Clear stale leader to prevent forwarding requests to self (which would
 		// cause a nil pointer panic since the local server is not in the clients map).
 		sm.currentLeader = ""
@@ -379,6 +380,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 	// at least as large as its own, it recognizes the leader as legitimate and steps down.
 	if sm.getRole() == konsen.Role_CANDIDATE {
 		sm.setRole(konsen.Role_FOLLOWER)
+		sm.numVotes = 0
 	}
 	// Only reset election timer for valid AppendEntries from current leader (per Raft paper Section 5.2).
 	sm.resetElectionTimer()
@@ -478,11 +480,9 @@ func (sm *StateMachine) handleAppendEntriesResp(
 		// If there exists N: N > commitIndex && a majority of matchIndex[i] ≥ N && log[N].term == currentTerm, then set commitIndex = N.
 		// Only need to find the highest index, as lower index logs will always match if a higher one matches.
 		for i := numEntries - 1; i >= 0; i-- {
-			logIndex := req.GetEntries()[i].GetIndex()
-			logTerm, err := sm.storage.GetLogTerm(logIndex)
-			if err != nil {
-				return fmt.Errorf("failed to get log term at index %d: %v", logIndex, err)
-			}
+			entry := req.GetEntries()[i]
+			logIndex := entry.GetIndex()
+			logTerm := entry.GetTerm()
 			if logIndex > sm.commitIndex && sm.isLogOnMajority(logIndex) && logTerm == currentTerm {
 				sm.commitIndex = logIndex
 				break
@@ -593,21 +593,23 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 
 // becomeLeader modifies internal state to become a leader, and starts the worker that periodically sends heartbeat.
 func (sm *StateMachine) becomeLeader(term uint64) error {
-	log.Infof("Term - %d, leader - %q.", term, sm.cluster.LocalServerName)
-	sm.setRole(konsen.Role_LEADER)
-	sm.currentLeader = sm.cluster.LocalServerName
 	lastLogIndex, err := sm.storage.LastLogIndex()
 	if err != nil {
 		return err
 	}
 
-	// Resets nextIndex and matchIndex after election.
+	// Initialize volatile leader state before announcing leadership,
+	// so a storage error doesn't leave us in a half-initialized leader state.
 	for server := range sm.cluster.Servers {
 		if server != sm.cluster.LocalServerName {
 			sm.nextIndex[server] = lastLogIndex + 1
 			sm.matchIndex[server] = 0
 		}
 	}
+
+	log.Infof("Term - %d, leader - %q.", term, sm.cluster.LocalServerName)
+	sm.setRole(konsen.Role_LEADER)
+	sm.currentLeader = sm.cluster.LocalServerName
 
 	// Create a new stop channel for the heartbeat loop.
 	sm.stopHeartbeatCh = make(chan struct{})
@@ -760,25 +762,33 @@ func (sm *StateMachine) handleElectionTimeout() error {
 	return nil
 }
 
+// maxApplyBatchSize caps the number of log entries applied per message loop iteration.
+// This prevents a large backlog (e.g., follower catch-up) from starving heartbeat processing.
+const maxApplyBatchSize = 100
+
 // maybeApplyLogs applies logs that are not yet.
 // This method is called from the message loop, so we can directly access condMap.
 func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) error {
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
-	for sm.commitIndex > sm.lastApplied {
-		sm.lastApplied++
-		logEntry, err := sm.storage.GetLog(sm.lastApplied)
+	applied := 0
+	for sm.commitIndex > sm.lastApplied && applied < maxApplyBatchSize {
+		nextIndex := sm.lastApplied + 1
+		logEntry, err := sm.storage.GetLog(nextIndex)
 		if err != nil {
-			return fmt.Errorf("failed to get log at index %d", sm.lastApplied)
+			return fmt.Errorf("failed to get log at index %d: %v", nextIndex, err)
 		}
 		if err := applyCommand(logEntry.GetData()); err != nil {
-			return fmt.Errorf("failed to apply command from log at index %d", sm.lastApplied)
+			return fmt.Errorf("failed to apply command from log at index %d: %v", nextIndex, err)
 		}
+		// Advance only after successful application to avoid skipping entries on error.
+		sm.lastApplied = nextIndex
 		// Notifies if there is a goroutine waiting on log[lastApplied] being applied.
 		if condCh, ok := sm.condMap[sm.lastApplied]; ok {
 			close(condCh)
 			// Note: deletion is handled by unregisterCondMsg from the waiting goroutine
 		}
 		log.Debugf("Applied log at index %d", sm.lastApplied)
+		applied++
 	}
 	return nil
 }
@@ -790,105 +800,126 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 	go func() {
 		defer sm.wg.Done()
 
-		for {
-			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine.
-			if err := sm.maybeApplyLogs(func(data []byte) error {
-				kvs := &konsen.KVList{}
-				if err := proto.Unmarshal(data, kvs); err != nil {
+		applyFn := func(data []byte) error {
+			kvs := &konsen.KVList{}
+			if err := proto.Unmarshal(data, kvs); err != nil {
+				return err
+			}
+			for _, kv := range kvs.GetKvList() {
+				if err := sm.storage.SetValue(kv.GetKey(), kv.GetValue()); err != nil {
 					return err
 				}
-				for _, kv := range kvs.GetKvList() {
-					if err := sm.storage.SetValue(kv.GetKey(), kv.GetValue()); err != nil {
-						return err
-					}
-				}
-				return nil
-			}); err != nil {
-				log.Fatalf("%v", err)
+			}
+			return nil
+		}
+
+		for {
+			// If commitIndex > lastApplied: apply up to maxApplyBatchSize entries.
+			if err := sm.maybeApplyLogs(applyFn); err != nil {
+				log.Fatalf("maybeApplyLogs: %v", err)
 			}
 
-			select {
-			case <-ctx.Done():
-				return
-			case <-sm.stopCh:
-				return
-			case msg, open := <-sm.msgCh:
-				if !open {
+			// If there are still entries pending, yield to messages non-blockingly
+			// so heartbeats and elections can be processed between batches.
+			var msg interface{}
+			var open bool
+			if sm.commitIndex > sm.lastApplied {
+				select {
+				case <-ctx.Done():
 					return
-				}
-
-				switch v := msg.(type) {
-				case appendEntriesWrap:
-					// Process incoming AppendEntries request.
-					resp, err := sm.handleAppendEntries(v.req)
-					if err != nil {
-						log.Errorf("handleAppendEntries failed: %v", err)
-						v.ch <- &konsen.AppendEntriesResp{Success: false}
-						continue
+				case <-sm.stopCh:
+					return
+				case msg, open = <-sm.msgCh:
+					if !open {
+						return
 					}
-					v.ch <- resp
-				case requestVoteWrap:
-					// Process incoming RequestVote request.
-					resp, err := sm.handleRequestVote(v.req)
-					if err != nil {
-						log.Errorf("handleRequestVote failed: %v", err)
-						v.ch <- &konsen.RequestVoteResp{VoteGranted: false}
-						continue
-					}
-					v.ch <- resp
-				case appendEntriesRespWrap:
-					if err := sm.handleAppendEntriesResp(v.resp, v.req, v.server); err != nil {
-						log.Fatalf("%v", err)
-					}
-				case *konsen.RequestVoteResp:
-					if err := sm.handleRequestVoteResp(v); err != nil {
-						log.Fatalf("%v", err)
-					}
-				case electionTimeoutMsg:
-					if err := sm.handleElectionTimeout(); err != nil {
-						log.Fatalf("%v", err)
-					}
-				case appendEntriesMsg:
-					if err := sm.sendAppendEntries(context.Background()); err != nil {
-						log.Fatalf("%v", err)
-					}
-				case putMsg:
-					if err := sm.handlePut(v.req, v.ch); err != nil {
-						log.Errorf("handlePut failed: %v", err)
-						v.ch <- &konsen.PutResp{
-							Success:      false,
-							ErrorMessage: "internal storage error",
-						}
-					}
-				case getSnapshotMsg:
-					snapshot, err := sm.handleGetSnapshot()
-					if err != nil {
-						log.Errorf("handleGetSnapshot failed: %v", err)
-					}
-					v.ch <- getSnapshotResp{snapshot: snapshot, err: err}
-				case getValueMsg:
-					sm.handleGetValue(v.key, v.ch)
-				case listKeysMsg:
-					keys, err := sm.storage.ListKeys(v.prefix, v.limit)
-					v.ch <- listKeysResp{keys: keys, err: err}
-				case registerCondMsg:
-					sm.condMap[v.logIndex] = v.condCh
-				case unregisterCondMsg:
-					delete(sm.condMap, v.logIndex)
-				case healthCheckMsg:
-					v.ch <- healthCheckResp{
-						role:          sm.getRole(),
-						currentLeader: sm.currentLeader,
-					}
-				case getStatusMsg:
-					status, err := sm.handleGetStatus()
-					if err != nil {
-						log.Errorf("handleGetStatus failed: %v", err)
-					}
-					v.ch <- getStatusResp{status: status, err: err}
 				default:
-					log.Fatalf("Unrecognized message: %v", v)
+					continue // No pending messages; loop back to apply more.
 				}
+			} else {
+				select {
+				case <-ctx.Done():
+					return
+				case <-sm.stopCh:
+					return
+				case msg, open = <-sm.msgCh:
+					if !open {
+						return
+					}
+				}
+			}
+
+			switch v := msg.(type) {
+			case appendEntriesWrap:
+				// Process incoming AppendEntries request.
+				resp, err := sm.handleAppendEntries(v.req)
+				if err != nil {
+					log.Errorf("handleAppendEntries failed: %v", err)
+					v.ch <- &konsen.AppendEntriesResp{Success: false}
+					continue
+				}
+				v.ch <- resp
+			case requestVoteWrap:
+				// Process incoming RequestVote request.
+				resp, err := sm.handleRequestVote(v.req)
+				if err != nil {
+					log.Errorf("handleRequestVote failed: %v", err)
+					v.ch <- &konsen.RequestVoteResp{VoteGranted: false}
+					continue
+				}
+				v.ch <- resp
+			case appendEntriesRespWrap:
+				if err := sm.handleAppendEntriesResp(v.resp, v.req, v.server); err != nil {
+					log.Fatalf("handleAppendEntriesResp failed: %v", err)
+				}
+			case *konsen.RequestVoteResp:
+				if err := sm.handleRequestVoteResp(v); err != nil {
+					log.Fatalf("handleRequestVoteResp failed: %v", err)
+				}
+			case electionTimeoutMsg:
+				if err := sm.handleElectionTimeout(); err != nil {
+					log.Fatalf("handleElectionTimeout failed: %v", err)
+				}
+			case appendEntriesMsg:
+				if err := sm.sendAppendEntries(context.Background()); err != nil {
+					log.Errorf("sendAppendEntries failed: %v", err)
+				}
+			case putMsg:
+				if err := sm.handlePut(v.req, v.ch); err != nil {
+					log.Errorf("handlePut failed: %v", err)
+					v.ch <- &konsen.PutResp{
+						Success:      false,
+						ErrorMessage: "internal storage error",
+					}
+				}
+			case getSnapshotMsg:
+				snapshot, err := sm.handleGetSnapshot()
+				if err != nil {
+					log.Errorf("handleGetSnapshot failed: %v", err)
+				}
+				v.ch <- getSnapshotResp{snapshot: snapshot, err: err}
+			case getValueMsg:
+				sm.handleGetValue(v.key, v.ch)
+			case listKeysMsg:
+				keys, err := sm.storage.ListKeys(v.prefix, v.limit)
+				v.ch <- listKeysResp{keys: keys, err: err}
+			case registerCondMsg:
+				sm.condMap[v.logIndex] = v.condCh
+			case unregisterCondMsg:
+				delete(sm.condMap, v.logIndex)
+			case healthCheckMsg:
+				v.ch <- healthCheckResp{
+					role:          sm.getRole(),
+					currentLeader: sm.currentLeader,
+				}
+			case getStatusMsg:
+				status, err := sm.handleGetStatus()
+				if err != nil {
+					log.Errorf("handleGetStatus failed: %v", err)
+				}
+				v.ch <- getStatusResp{status: status, err: err}
+			default:
+				log.Fatalf("Unrecognized message: %v", v)
 			}
 		}
 	}()

@@ -754,6 +754,218 @@ func TestContextCancellation(t *testing.T) {
 	}
 }
 
+// waitForRole polls until the state machine reaches the expected role or times out.
+func waitForRole(t *testing.T, sm *StateMachine, role konsen.Role, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if sm.getRole() == role {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for role %v, got %v", role, sm.getRole())
+}
+
+func TestLeaderPutAndGet(t *testing.T) {
+	fastCfg := StateMachineConfig{
+		MinTimeout:  100 * time.Millisecond,
+		TimeoutSpan: 100 * time.Millisecond,
+		Heartbeat:   20 * time.Millisecond,
+	}
+	sm, mocks, cancel := makeTestSMWithConfig(t, "node1", fastCfg)
+	defer stopSM(sm, cancel)
+
+	// Grant votes so node becomes leader.
+	for _, m := range mocks {
+		m.mu.Lock()
+		m.requestVoteFunc = func(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
+			return &konsen.RequestVoteResp{Term: in.GetTerm(), VoteGranted: true}, nil
+		}
+		m.mu.Unlock()
+	}
+
+	waitForRole(t, sm, konsen.Role_LEADER, 3*time.Second)
+
+	ctx, c := context.WithTimeout(context.Background(), 5*time.Second)
+	defer c()
+
+	// Submit a Put request (leader writes to log, replicates, commits, applies).
+	resp, err := sm.Put(ctx, &konsen.PutReq{Data: marshalKV(t, "mykey", "myvalue")})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Fatalf("Put failed: %s", resp.GetErrorMessage())
+	}
+
+	// Verify the value was applied to the KV store.
+	val, err := sm.GetValue(ctx, []byte("mykey"))
+	if err != nil {
+		t.Fatalf("GetValue: %v", err)
+	}
+	if string(val) != "myvalue" {
+		t.Errorf("GetValue = %q, want %q", val, "myvalue")
+	}
+
+	// Verify commit/apply indices advanced.
+	snapshot, err := sm.GetSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if snapshot.CommitIndex < 1 {
+		t.Errorf("commitIndex = %d, want >= 1", snapshot.CommitIndex)
+	}
+	if snapshot.LastApplied < 1 {
+		t.Errorf("lastApplied = %d, want >= 1", snapshot.LastApplied)
+	}
+}
+
+func TestCandidate_StepsDownOnAppendEntries(t *testing.T) {
+	fastCfg := StateMachineConfig{
+		MinTimeout:  100 * time.Millisecond,
+		TimeoutSpan: 100 * time.Millisecond,
+		Heartbeat:   20 * time.Millisecond,
+	}
+	sm, mocks, cancel := makeTestSMWithConfig(t, "node1", fastCfg)
+	defer stopSM(sm, cancel)
+
+	// Deny votes so node stays candidate.
+	for _, m := range mocks {
+		m.mu.Lock()
+		m.requestVoteFunc = func(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
+			return &konsen.RequestVoteResp{Term: in.GetTerm(), VoteGranted: false}, nil
+		}
+		m.mu.Unlock()
+	}
+
+	waitForRole(t, sm, konsen.Role_CANDIDATE, 3*time.Second)
+
+	// Get the candidate's current term.
+	candidateTerm, _ := sm.storage.GetCurrentTerm()
+
+	ctx, c := context.WithTimeout(context.Background(), 2*time.Second)
+	defer c()
+
+	// Send AppendEntries from a leader with the same term.
+	resp, err := sm.AppendEntries(ctx, &konsen.AppendEntriesReq{
+		Term:     candidateTerm,
+		LeaderId: "node2",
+	})
+	if err != nil {
+		t.Fatalf("AppendEntries: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Error("expected success")
+	}
+
+	// Node should step down to follower.
+	time.Sleep(50 * time.Millisecond)
+	if sm.getRole() != konsen.Role_FOLLOWER {
+		t.Errorf("role = %v, want FOLLOWER after receiving AppendEntries from leader", sm.getRole())
+	}
+}
+
+func TestFollowerLogApplication(t *testing.T) {
+	sm, _, cancel := makeTestSM(t, "node1")
+	defer stopSM(sm, cancel)
+
+	// Pre-populate logs with KV data.
+	sm.storage.WriteLogs([]*konsen.Log{
+		{Index: 1, Term: 1, Data: marshalKV(t, "k1", "v1")},
+		{Index: 2, Term: 1, Data: marshalKV(t, "k2", "v2")},
+		{Index: 3, Term: 1, Data: marshalKV(t, "k3", "v3")},
+	})
+
+	ctx, c := context.WithTimeout(context.Background(), 2*time.Second)
+	defer c()
+
+	// Leader sends heartbeat with leaderCommit=3, advancing follower's commitIndex.
+	resp, err := sm.AppendEntries(ctx, &konsen.AppendEntriesReq{
+		Term:         1,
+		LeaderId:     "node2",
+		PrevLogIndex: 3,
+		PrevLogTerm:  1,
+		LeaderCommit: 3,
+	})
+	if err != nil {
+		t.Fatalf("AppendEntries: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Error("expected success")
+	}
+
+	// Wait for log application.
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify all three KV pairs were applied.
+	snapshot, err := sm.GetSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if snapshot.CommitIndex != 3 {
+		t.Errorf("commitIndex = %d, want 3", snapshot.CommitIndex)
+	}
+	if snapshot.LastApplied != 3 {
+		t.Errorf("lastApplied = %d, want 3", snapshot.LastApplied)
+	}
+
+	// Verify KV state via direct storage read (follower can't serve GetValue).
+	v1, _ := sm.storage.GetValue([]byte("k1"))
+	v2, _ := sm.storage.GetValue([]byte("k2"))
+	v3, _ := sm.storage.GetValue([]byte("k3"))
+	if string(v1) != "v1" || string(v2) != "v2" || string(v3) != "v3" {
+		t.Errorf("applied KV mismatch: k1=%q k2=%q k3=%q", v1, v2, v3)
+	}
+}
+
+func TestMaybeApplyLogs_BatchCap(t *testing.T) {
+	sm, _, cancel := makeTestSM(t, "node1")
+	defer stopSM(sm, cancel)
+
+	// Pre-populate more logs than maxApplyBatchSize (100).
+	numLogs := maxApplyBatchSize + 50
+	logs := make([]*konsen.Log, numLogs)
+	for i := 0; i < numLogs; i++ {
+		logs[i] = &konsen.Log{
+			Index: uint64(i + 1),
+			Term:  1,
+			Data:  marshalKV(t, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i)),
+		}
+	}
+	sm.storage.WriteLogs(logs)
+
+	ctx, c := context.WithTimeout(context.Background(), 5*time.Second)
+	defer c()
+
+	// Advance commitIndex to numLogs via AppendEntries.
+	resp, err := sm.AppendEntries(ctx, &konsen.AppendEntriesReq{
+		Term:         1,
+		LeaderId:     "node2",
+		PrevLogIndex: uint64(numLogs),
+		PrevLogTerm:  1,
+		LeaderCommit: uint64(numLogs),
+	})
+	if err != nil {
+		t.Fatalf("AppendEntries: %v", err)
+	}
+	if !resp.GetSuccess() {
+		t.Error("expected success")
+	}
+
+	// Wait enough for all batches to complete.
+	time.Sleep(500 * time.Millisecond)
+
+	// All entries should eventually be applied across multiple batch iterations.
+	snapshot, err := sm.GetSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if snapshot.LastApplied != uint64(numLogs) {
+		t.Errorf("lastApplied = %d, want %d", snapshot.LastApplied, numLogs)
+	}
+}
+
 // marshalKV is a test helper to create serialized KVList data.
 func marshalKV(t *testing.T, key, value string) []byte {
 	t.Helper()

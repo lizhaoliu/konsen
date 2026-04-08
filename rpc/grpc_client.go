@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"time"
 
 	"github.com/lizhaoliu/konsen/v2/core"
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
@@ -29,7 +30,11 @@ func NewPeerGRPCClient(config PeerGRPCClientConfig) (*core.PeerClient, error) {
 	conn, err := grpc.NewClient(
 		config.Endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()), // TODO: enable secured connection.
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{}),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second, // Send keepalive ping every 10s if no activity.
+			Timeout:             3 * time.Second,  // Wait 3s for ping ack before considering dead.
+			PermitWithoutStream: true,             // Ping even when no active RPCs.
+		}),
 	)
 	if err != nil {
 		return nil, err

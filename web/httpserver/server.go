@@ -44,7 +44,6 @@ func NewServer(config ServerConfig) *Server {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
-	httpServer.SetKeepAlivesEnabled(false)
 
 	s := &Server{
 		sm:              config.StateMachine,

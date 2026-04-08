@@ -9,6 +9,7 @@ import (
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 const rpcTimeout = 10 * time.Second
@@ -57,7 +58,12 @@ func (r *RaftGRPCServer) Serve() error {
 	if err != nil {
 		logrus.Fatalf("Failed to start server: %v", err)
 	}
-	server := grpc.NewServer()
+	server := grpc.NewServer(
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
 	konsen.RegisterRaftServer(server, r)
 	konsen.RegisterKVServiceServer(server, r.kvServer)
 	r.server = server
