@@ -3,6 +3,7 @@ package httpserver
 import (
 	"context"
 	_ "embed"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -249,6 +250,15 @@ func (s *Server) apiStatusHandler(c *gin.Context) {
 
 func (s *Server) Run() error {
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+// RunListener starts the HTTP server on an existing listener.
+// This is useful for tests that need to know the actual bound address (e.g., when using ":0").
+func (s *Server) RunListener(lis net.Listener) error {
+	if err := s.httpServer.Serve(lis); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil

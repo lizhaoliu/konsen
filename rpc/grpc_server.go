@@ -52,12 +52,7 @@ func (r *RaftGRPCServer) RequestVote(ctx context.Context, req *konsen.RequestVot
 	return r.sm.RequestVote(ctx, req)
 }
 
-func (r *RaftGRPCServer) Serve() error {
-	logrus.Infof("Start konsen server on: %q", r.endpoint)
-	lis, err := net.Listen("tcp", r.endpoint)
-	if err != nil {
-		logrus.Fatalf("Failed to start server: %v", err)
-	}
+func (r *RaftGRPCServer) newServer() *grpc.Server {
 	server := grpc.NewServer(
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             5 * time.Second,
@@ -67,7 +62,22 @@ func (r *RaftGRPCServer) Serve() error {
 	konsen.RegisterRaftServer(server, r)
 	konsen.RegisterKVServiceServer(server, r.kvServer)
 	r.server = server
-	return server.Serve(lis)
+	return server
+}
+
+func (r *RaftGRPCServer) Serve() error {
+	logrus.Infof("Start konsen server on: %q", r.endpoint)
+	lis, err := net.Listen("tcp", r.endpoint)
+	if err != nil {
+		logrus.Fatalf("Failed to start server: %v", err)
+	}
+	return r.newServer().Serve(lis)
+}
+
+// ServeListener starts the gRPC server on an existing listener.
+// This is useful for tests that need to know the actual bound address (e.g., when using ":0").
+func (r *RaftGRPCServer) ServeListener(lis net.Listener) error {
+	return r.newServer().Serve(lis)
 }
 
 func (r *RaftGRPCServer) Stop() {

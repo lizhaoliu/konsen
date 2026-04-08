@@ -189,10 +189,10 @@ func (tc *testCluster) restartNode(name string) error {
 	}
 
 	type peerInfo struct {
-		target                  *core.StateMachine
-		blocked                 bool
-		delay                   time.Duration
-		dropRate                float64
+		target   *core.StateMachine
+		blocked  bool
+		delay    time.Duration
+		dropRate float64
 	}
 	peers := make(map[string]peerInfo)
 	oldClients := tc.clients[name]
