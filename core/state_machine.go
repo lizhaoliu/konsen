@@ -20,6 +20,9 @@ const (
 	defaultHeartbeat   = 100 * time.Millisecond
 
 	defaultRequestTimeout = 5 * time.Second
+
+	defaultSnapshotThreshold uint64 = 10000
+	defaultSnapshotChunkSize        = 1024 * 1024 // 1MB
 )
 
 // StateMachine is the state machine that implements Raft algorithm: https://raft.github.io/raft.pdf.
@@ -67,6 +70,27 @@ type StateMachine struct {
 	// Key: log index (uint64), Value: chan struct{}
 	// Managed via message passing through registerCondMsg and unregisterCondMsg.
 	condMap map[uint64]chan struct{}
+
+	// Snapshot state (volatile cache of persisted snapshot metadata, loaded on startup).
+	snapshotIndex uint64 // lastIncludedIndex of the most recent snapshot.
+	snapshotTerm  uint64 // lastIncludedTerm of the most recent snapshot.
+
+	// Snapshot configuration.
+	snapshotThreshold uint64 // Number of applied entries since last snapshot before triggering compaction.
+	snapshotChunkSize int    // Chunk size in bytes for InstallSnapshot transfers.
+
+	// Tracks in-flight snapshot transfers to followers to avoid redundant goroutines.
+	snapshotInFlight map[string]bool
+
+	// Follower-side buffer for assembling snapshot chunks from leader.
+	pendingSnapshot *pendingSnapshotState
+}
+
+// pendingSnapshotState tracks an in-progress chunked snapshot transfer on the follower side.
+type pendingSnapshotState struct {
+	lastIncludedIndex uint64
+	lastIncludedTerm  uint64
+	data              []byte // assembled snapshot data
 }
 
 // StateMachineConfig
@@ -79,6 +103,10 @@ type StateMachineConfig struct {
 	MinTimeout  time.Duration // Minimum election timeout.
 	TimeoutSpan time.Duration // Random span added to MinTimeout.
 	Heartbeat   time.Duration // Heartbeat interval.
+
+	// Snapshot configuration (zero values use defaults).
+	SnapshotThreshold uint64 // Number of applied entries since last snapshot before triggering compaction.
+	SnapshotChunkSize int    // Chunk size in bytes for InstallSnapshot transfers.
 }
 
 // Snapshot is a snapshot of the internal state of a state machine.
@@ -94,6 +122,8 @@ type Snapshot struct {
 	LogIndices    []uint64          // Logs indices.
 	LogTerms      []uint64          // Log terms.
 	LogBytes      []int             // Log binary sizes.
+	SnapshotIndex uint64            // lastIncludedIndex of the most recent snapshot (0 if none).
+	SnapshotTerm  uint64            // lastIncludedTerm of the most recent snapshot (0 if none).
 }
 
 // appendEntriesWrap
@@ -195,6 +225,8 @@ type StatusSnapshot struct {
 	NextIndex     map[string]uint64
 	MatchIndex    map[string]uint64
 	LogCount      uint64
+	SnapshotIndex uint64
+	SnapshotTerm  uint64
 }
 
 // getStatusResp is the response for a getStatusMsg.
@@ -206,6 +238,19 @@ type getStatusResp struct {
 // getStatusMsg represents a message to retrieve a lightweight status snapshot.
 type getStatusMsg struct {
 	ch chan<- getStatusResp
+}
+
+// installSnapshotWrap wraps an incoming InstallSnapshot request.
+type installSnapshotWrap struct {
+	req *konsen.InstallSnapshotReq
+	ch  chan<- *konsen.InstallSnapshotResp
+}
+
+// installSnapshotRespWrap wraps a response to an InstallSnapshot we sent.
+type installSnapshotRespWrap struct {
+	resp   *konsen.InstallSnapshotResp
+	req    *konsen.InstallSnapshotReq
+	server string
 }
 
 // NewStateMachine creates a new instance of the state machine.
@@ -227,6 +272,21 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 		heartbeat = defaultHeartbeat
 	}
 
+	snapshotThreshold := config.SnapshotThreshold
+	if snapshotThreshold == 0 {
+		snapshotThreshold = defaultSnapshotThreshold
+	}
+	snapshotChunkSize := config.SnapshotChunkSize
+	if snapshotChunkSize == 0 {
+		snapshotChunkSize = defaultSnapshotChunkSize
+	}
+
+	// Load snapshot metadata from persistent storage.
+	snapshotIndex, snapshotTerm, err := config.Storage.GetSnapshotMeta()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load snapshot metadata: %v", err)
+	}
+
 	sm := &StateMachine{
 		msgCh:           make(chan interface{}),
 		stopCh:          make(chan struct{}),
@@ -237,8 +297,9 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 		cluster: config.Cluster,
 		clients: config.Clients,
 
-		commitIndex: 0,
-		lastApplied: 0,
+		// Initialize volatile state from snapshot: entries up to snapshotIndex have been applied.
+		commitIndex: snapshotIndex,
+		lastApplied: snapshotIndex,
 
 		nextIndex:  make(map[string]uint64),
 		matchIndex: make(map[string]uint64),
@@ -248,6 +309,13 @@ func NewStateMachine(config StateMachineConfig) (*StateMachine, error) {
 		heartbeat:   heartbeat,
 
 		condMap: make(map[uint64]chan struct{}),
+
+		snapshotIndex:     snapshotIndex,
+		snapshotTerm:      snapshotTerm,
+		snapshotThreshold: snapshotThreshold,
+		snapshotChunkSize: snapshotChunkSize,
+
+		snapshotInFlight: make(map[string]bool),
 	}
 	sm.setRole(konsen.Role_FOLLOWER)
 
@@ -362,6 +430,45 @@ func (sm *StateMachine) resetElectionTimer() {
 	}
 }
 
+// effectiveLogTerm returns the term for a given log index, accounting for the snapshot boundary.
+// Called only from the message loop (single-threaded).
+func (sm *StateMachine) effectiveLogTerm(index uint64) (uint64, error) {
+	if index == 0 {
+		return 0, nil
+	}
+	if index == sm.snapshotIndex {
+		return sm.snapshotTerm, nil
+	}
+	if index < sm.snapshotIndex {
+		return 0, nil
+	}
+	return sm.storage.GetLogTerm(index)
+}
+
+// effectiveLastLogIndex returns the last log index, accounting for snapshot.
+func (sm *StateMachine) effectiveLastLogIndex() (uint64, error) {
+	lastIdx, err := sm.storage.LastLogIndex()
+	if err != nil {
+		return 0, err
+	}
+	if sm.snapshotIndex > lastIdx {
+		return sm.snapshotIndex, nil
+	}
+	return lastIdx, nil
+}
+
+// effectiveLastLogTerm returns the term of the last log entry, accounting for snapshot.
+func (sm *StateMachine) effectiveLastLogTerm() (uint64, error) {
+	lastIdx, err := sm.storage.LastLogIndex()
+	if err != nil {
+		return 0, err
+	}
+	if lastIdx == 0 || lastIdx <= sm.snapshotIndex {
+		return sm.snapshotTerm, nil
+	}
+	return sm.storage.LastLogTerm()
+}
+
 // handleAppendEntries handles a AppendEntries request.
 func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error) {
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower.
@@ -387,7 +494,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 	sm.currentLeader = req.GetLeaderId()
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
-	prevLogTerm, err := sm.storage.GetLogTerm(req.GetPrevLogIndex())
+	prevLogTerm, err := sm.effectiveLogTerm(req.GetPrevLogIndex())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get log at index %d: %v", req.GetPrevLogIndex(), err)
 	}
@@ -435,7 +542,7 @@ func (sm *StateMachine) handleAppendEntries(req *konsen.AppendEntriesReq) (*kons
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
 	if req.GetLeaderCommit() > sm.commitIndex {
-		lastLogIndex, err := sm.storage.LastLogIndex()
+		lastLogIndex, err := sm.effectiveLastLogIndex()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get index of the last log: %v", err)
 		}
@@ -539,7 +646,7 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq) (*konsen.R
 	// If candidate’s log is at least as up-to-date as receiver’s log, grant vote.
 
 	// If the logs have last entries with different terms, then the log with the later term is more up-to-date.
-	lastLogTerm, err := sm.storage.LastLogTerm()
+	lastLogTerm, err := sm.effectiveLastLogTerm()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get last log's term: %v", err)
 	}
@@ -554,7 +661,7 @@ func (sm *StateMachine) handleRequestVote(req *konsen.RequestVoteReq) (*konsen.R
 	}
 
 	// If last logs have the same term, then whichever log is longer is more up-to-date.
-	lastLogIndex, err := sm.storage.LastLogIndex()
+	lastLogIndex, err := sm.effectiveLastLogIndex()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get last log's index: %v", err)
 	}
@@ -593,7 +700,7 @@ func (sm *StateMachine) handleRequestVoteResp(resp *konsen.RequestVoteResp) erro
 
 // becomeLeader modifies internal state to become a leader, and starts the worker that periodically sends heartbeat.
 func (sm *StateMachine) becomeLeader(term uint64) error {
-	lastLogIndex, err := sm.storage.LastLogIndex()
+	lastLogIndex, err := sm.effectiveLastLogIndex()
 	if err != nil {
 		return err
 	}
@@ -624,11 +731,11 @@ func (sm *StateMachine) sendVoteRequests(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get current term: %v", err)
 	}
-	lastLogIndex, err := sm.storage.LastLogIndex()
+	lastLogIndex, err := sm.effectiveLastLogIndex()
 	if err != nil {
 		return fmt.Errorf("failed to get last log index: %v", err)
 	}
-	lastLogTerm, err := sm.storage.LastLogTerm()
+	lastLogTerm, err := sm.effectiveLastLogTerm()
 	if err != nil {
 		return fmt.Errorf("failed to get last log term: %v", err)
 	}
@@ -679,8 +786,21 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 
 	for server := range sm.cluster.Servers {
 		if server != sm.cluster.LocalServerName {
+			// If the follower needs entries that have been compacted,
+			// send InstallSnapshot instead of AppendEntries (Raft paper Section 7).
+			// While a transfer is in flight we skip AppendEntries for this follower; the
+			// InstallSnapshot chunks themselves act as leader contact and reset the
+			// follower's election timer.
+			if sm.nextIndex[server] <= sm.snapshotIndex {
+				if !sm.snapshotInFlight[server] {
+					sm.snapshotInFlight[server] = true
+					sm.sendInstallSnapshot(ctx, server, currentTerm)
+				}
+				continue
+			}
+
 			prevLogIndex := sm.nextIndex[server] - 1
-			prevLogTerm, err := sm.storage.GetLogTerm(prevLogIndex)
+			prevLogTerm, err := sm.effectiveLogTerm(prevLogIndex)
 			if err != nil {
 				return fmt.Errorf("failed to get log term at index %d: %v", prevLogIndex, err)
 			}
@@ -777,6 +897,9 @@ func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) 
 		if err != nil {
 			return fmt.Errorf("failed to get log at index %d: %v", nextIndex, err)
 		}
+		if logEntry == nil {
+			return fmt.Errorf("log entry at index %d is nil (may have been compacted by snapshot)", nextIndex)
+		}
 		if err := applyCommand(logEntry.GetData()); err != nil {
 			return fmt.Errorf("failed to apply command from log at index %d: %v", nextIndex, err)
 		}
@@ -790,6 +913,310 @@ func (sm *StateMachine) maybeApplyLogs(applyCommand func(command []byte) error) 
 		log.Debugf("Applied log at index %d", sm.lastApplied)
 		applied++
 	}
+	return nil
+}
+
+// maybeTakeSnapshot checks if enough entries have been applied since the last snapshot
+// to warrant creating a new snapshot and compacting the log.
+func (sm *StateMachine) maybeTakeSnapshot() error {
+	if sm.lastApplied <= sm.snapshotIndex {
+		return nil
+	}
+	if sm.lastApplied-sm.snapshotIndex < sm.snapshotThreshold {
+		return nil
+	}
+
+	snapshotTerm, err := sm.effectiveLogTerm(sm.lastApplied)
+	if err != nil {
+		return fmt.Errorf("failed to get log term at index %d for snapshot: %v", sm.lastApplied, err)
+	}
+
+	// Serialize the KV state machine into a snapshot file.
+	kvData, err := sm.storage.SnapshotKVData()
+	if err != nil {
+		return fmt.Errorf("failed to serialize KV data for snapshot: %v", err)
+	}
+	if err := sm.storage.SaveSnapshotFile(kvData); err != nil {
+		return fmt.Errorf("failed to save snapshot file: %v", err)
+	}
+
+	// Persist snapshot metadata.
+	if err := sm.storage.SetSnapshotMeta(sm.lastApplied, snapshotTerm); err != nil {
+		return fmt.Errorf("failed to persist snapshot metadata: %v", err)
+	}
+
+	// Delete compacted log entries.
+	if err := sm.storage.DeleteLogsUpTo(sm.lastApplied); err != nil {
+		return fmt.Errorf("failed to delete compacted logs: %v", err)
+	}
+
+	sm.snapshotIndex = sm.lastApplied
+	sm.snapshotTerm = snapshotTerm
+
+	log.Infof("Snapshot taken at index %d, term %d", sm.snapshotIndex, sm.snapshotTerm)
+	return nil
+}
+
+// sendInstallSnapshot sends a snapshot to a follower in chunks (Raft paper Figure 13).
+// Called from the message loop when nextIndex[server] <= snapshotIndex.
+// The caller must set snapshotInFlight[server] = true before calling. On a load
+// failure the flag is cleared here (we are on the message loop); otherwise the spawned
+// goroutine always sends an installSnapshotRespWrap back (with resp==nil on transfer
+// failure) so the flag is cleared in handleInstallSnapshotResp.
+func (sm *StateMachine) sendInstallSnapshot(ctx context.Context, server string, term uint64) {
+	// Capture the snapshot metadata AND load its bytes here on the message loop so the
+	// advertised (lastIncludedIndex, lastIncludedTerm) always matches the data being
+	// sent. maybeTakeSnapshot also runs on this loop, so loading off-loop could pair an
+	// old index/term with a newer snapshot file (or vice versa). Only the network
+	// transfer is deferred to the goroutine.
+	snapshotIndex := sm.snapshotIndex
+	snapshotTerm := sm.snapshotTerm
+	chunkSize := sm.snapshotChunkSize
+
+	snapshotData, err := sm.storage.LoadSnapshotFile()
+	if err != nil || len(snapshotData) == 0 {
+		log.Errorf("Failed to load snapshot file for %q: %v", server, err)
+		// Clear the flag so the next heartbeat cycle can retry.
+		delete(sm.snapshotInFlight, server)
+		return
+	}
+
+	sm.wg.Add(1)
+	go func() {
+		defer sm.wg.Done()
+
+		// notify sends the result (success or failure) back through the message loop
+		// so that snapshotInFlight is always cleared on the main goroutine.
+		notify := func(resp *konsen.InstallSnapshotResp, req *konsen.InstallSnapshotReq) {
+			select {
+			case sm.msgCh <- installSnapshotRespWrap{
+				resp:   resp,
+				req:    req,
+				server: server,
+			}:
+			case <-sm.stopCh:
+			}
+		}
+
+		for offset := 0; offset < len(snapshotData); {
+			end := offset + chunkSize
+			if end > len(snapshotData) {
+				end = len(snapshotData)
+			}
+			done := end == len(snapshotData)
+
+			req := &konsen.InstallSnapshotReq{
+				Term:              term,
+				LeaderId:          sm.cluster.LocalServerName,
+				LastIncludedIndex: snapshotIndex,
+				LastIncludedTerm:  snapshotTerm,
+				Offset:            uint64(offset),
+				Data:              snapshotData[offset:end],
+				Done:              done,
+			}
+
+			rpcCtx, cancel := context.WithTimeout(ctx, defaultRequestTimeout)
+			resp, err := sm.clients[server].Raft.InstallSnapshot(rpcCtx, req)
+			cancel()
+			if err != nil {
+				log.Debugf("Failed to send InstallSnapshot chunk to %q (offset=%d): %v", server, offset, err)
+				notify(nil, req)
+				return
+			}
+
+			// If the follower reports a higher term, the leader is stale -- stop sending
+			// the remaining chunks and route the response back so the leader steps down.
+			if resp.GetTerm() > term {
+				notify(resp, req)
+				return
+			}
+
+			// If not the final chunk, just advance offset and send the next chunk.
+			if !done {
+				offset = end
+				continue
+			}
+
+			// Final chunk: send response through the message loop to update nextIndex/matchIndex.
+			notify(resp, req)
+			return
+		}
+	}()
+}
+
+// InstallSnapshot puts the incoming InstallSnapshot request in the message channel and waits for result.
+func (sm *StateMachine) InstallSnapshot(ctx context.Context, req *konsen.InstallSnapshotReq) (*konsen.InstallSnapshotResp, error) {
+	ch := make(chan *konsen.InstallSnapshotResp, 1)
+	select {
+	case sm.msgCh <- installSnapshotWrap{req: req, ch: ch}:
+	case <-sm.stopCh:
+		return nil, fmt.Errorf("server has been shut down")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		return resp, nil
+	}
+}
+
+// handleInstallSnapshot processes an InstallSnapshot RPC from the leader (Figure 13 steps 1-8).
+func (sm *StateMachine) handleInstallSnapshot(req *konsen.InstallSnapshotReq) (*konsen.InstallSnapshotResp, error) {
+	currentTerm, err := sm.maybeBecomeFollower(req.GetTerm())
+	if err != nil {
+		return nil, err
+	}
+
+	// 1. Reply immediately if term < currentTerm.
+	if req.GetTerm() < currentTerm {
+		return &konsen.InstallSnapshotResp{Term: currentTerm}, nil
+	}
+
+	// Valid leader -- reset election timer, record leader.
+	// Per Raft paper Section 5.2: if a candidate receives a valid RPC from a leader with a term
+	// at least as large as its own, it recognizes the leader as legitimate and steps down.
+	if sm.getRole() == konsen.Role_CANDIDATE {
+		sm.setRole(konsen.Role_FOLLOWER)
+		sm.numVotes = 0
+	}
+	sm.resetElectionTimer()
+	sm.currentLeader = req.GetLeaderId()
+
+	// 2. Create new snapshot file if first chunk (offset is 0).
+	if req.GetOffset() == 0 {
+		sm.pendingSnapshot = &pendingSnapshotState{
+			lastIncludedIndex: req.GetLastIncludedIndex(),
+			lastIncludedTerm:  req.GetLastIncludedTerm(),
+			data:              make([]byte, 0),
+		}
+	}
+
+	if sm.pendingSnapshot == nil {
+		// Received a non-first chunk without a pending snapshot -- stale or out-of-order.
+		return &konsen.InstallSnapshotResp{Term: currentTerm}, nil
+	}
+
+	// 3. Write data into snapshot file at given offset.
+	offset := int(req.GetOffset())
+	if offset != len(sm.pendingSnapshot.data) {
+		// Offset mismatch -- discard pending snapshot and let leader retry. With in-order
+		// sequential unary chunks this is unreachable; if it ever fires (a dropped or
+		// reordered chunk), the leader's next AppendEntries probe reconciles via a
+		// prevLogTerm mismatch, so no stale snapshot is silently accepted.
+		sm.pendingSnapshot = nil
+		return &konsen.InstallSnapshotResp{Term: currentTerm}, nil
+	}
+	sm.pendingSnapshot.data = append(sm.pendingSnapshot.data, req.GetData()...)
+
+	// 4. Reply and wait for more data chunks if done is false.
+	if !req.GetDone() {
+		return &konsen.InstallSnapshotResp{Term: currentTerm}, nil
+	}
+
+	// 5. Save snapshot file, discard any existing or partial snapshot with a smaller index.
+	pending := sm.pendingSnapshot
+	sm.pendingSnapshot = nil
+
+	if pending.lastIncludedIndex <= sm.snapshotIndex {
+		// Stale snapshot -- ignore.
+		return &konsen.InstallSnapshotResp{Term: currentTerm}, nil
+	}
+
+	// 6. Decide whether the existing log already contains an entry matching the
+	//    snapshot's last included entry. If so we retain the entries following it;
+	//    otherwise the whole log is discarded. This is a read-only decision -- the
+	//    actual deletion is deferred until after the snapshot is durably committed
+	//    (below) so a crash mid-install can never strand metadata ahead of the log.
+	retainSuffix := false
+	lastLogIndex, err := sm.storage.LastLogIndex()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get last log index: %v", err)
+	}
+	if lastLogIndex >= pending.lastIncludedIndex {
+		logTerm, err := sm.storage.GetLogTerm(pending.lastIncludedIndex)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get log term: %v", err)
+		}
+		retainSuffix = logTerm == pending.lastIncludedTerm
+	}
+
+	// 7 & 8. Reset the state machine from the snapshot, then commit, then compact.
+	//
+	// Ordering is crash-safety critical. SetSnapshotMeta is the commit point, so it
+	// must come AFTER the KV state is durably restored: snapshotIndex claims that
+	// everything up to it is applied and durable, so persisting it while the KV state
+	// is still stale would leave the node permanently believing it is caught up with
+	// data it never applied (the compacted logs are gone and cannot be replayed).
+	// Deleting the log happens LAST: a crash before that only leaves harmless stale
+	// entries <= snapshotIndex, which are never re-applied (lastApplied ==
+	// snapshotIndex) and are reconciled by the leader's subsequent AppendEntries.
+	if err := sm.storage.RestoreKVData(pending.data); err != nil {
+		return nil, fmt.Errorf("failed to restore KV data from snapshot: %v", err)
+	}
+	if err := sm.storage.SaveSnapshotFile(pending.data); err != nil {
+		return nil, fmt.Errorf("failed to save snapshot file: %v", err)
+	}
+	if err := sm.storage.SetSnapshotMeta(pending.lastIncludedIndex, pending.lastIncludedTerm); err != nil {
+		return nil, fmt.Errorf("failed to set snapshot metadata: %v", err)
+	}
+
+	// Metadata is durable and matches the restored KV state; advance volatile state.
+	// RestoreKVData replaced the entire KV state with the snapshot's state, so
+	// lastApplied must match snapshotIndex regardless of its previous value.
+	sm.snapshotIndex = pending.lastIncludedIndex
+	sm.snapshotTerm = pending.lastIncludedTerm
+	sm.lastApplied = sm.snapshotIndex
+	if sm.commitIndex < sm.snapshotIndex {
+		sm.commitIndex = sm.snapshotIndex
+	}
+
+	// Compact the log last (see ordering note above).
+	if retainSuffix {
+		// Matching entry -- keep entries after lastIncludedIndex, discard the rest.
+		if err := sm.storage.DeleteLogsUpTo(pending.lastIncludedIndex); err != nil {
+			return nil, fmt.Errorf("failed to delete logs up to %d: %v", pending.lastIncludedIndex, err)
+		}
+	} else {
+		// No matching entry -- discard the entire log.
+		if err := sm.storage.DeleteLogsFrom(1); err != nil {
+			return nil, fmt.Errorf("failed to delete all logs: %v", err)
+		}
+	}
+
+	log.Infof("Installed snapshot at index %d, term %d from leader %q",
+		sm.snapshotIndex, sm.snapshotTerm, req.GetLeaderId())
+	return &konsen.InstallSnapshotResp{Term: currentTerm}, nil
+}
+
+// handleInstallSnapshotResp handles a response to an InstallSnapshot we sent.
+// resp may be nil if the transfer failed — in that case we only clear the in-flight flag
+// so the next heartbeat cycle can retry.
+func (sm *StateMachine) handleInstallSnapshotResp(
+	resp *konsen.InstallSnapshotResp,
+	req *konsen.InstallSnapshotReq,
+	server string) error {
+
+	// Always clear the in-flight flag so the transfer can be retried.
+	delete(sm.snapshotInFlight, server)
+
+	if resp == nil {
+		return nil
+	}
+
+	if _, err := sm.maybeBecomeFollower(resp.GetTerm()); err != nil {
+		return err
+	}
+
+	if sm.getRole() != konsen.Role_LEADER {
+		return nil
+	}
+
+	// Update nextIndex and matchIndex for this follower.
+	sm.nextIndex[server] = req.GetLastIncludedIndex() + 1
+	sm.matchIndex[server] = req.GetLastIncludedIndex()
+
 	return nil
 }
 
@@ -817,6 +1244,9 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 			// If commitIndex > lastApplied: apply up to maxApplyBatchSize entries.
 			if err := sm.maybeApplyLogs(applyFn); err != nil {
 				log.Fatalf("maybeApplyLogs: %v", err)
+			}
+			if err := sm.maybeTakeSnapshot(); err != nil {
+				log.Errorf("maybeTakeSnapshot: %v", err)
 			}
 
 			// If there are still entries pending, yield to messages non-blockingly
@@ -918,6 +1348,22 @@ func (sm *StateMachine) startMessageLoop(ctx context.Context) {
 					log.Errorf("handleGetStatus failed: %v", err)
 				}
 				v.ch <- getStatusResp{status: status, err: err}
+			case installSnapshotWrap:
+				resp, err := sm.handleInstallSnapshot(v.req)
+				if err != nil {
+					log.Errorf("handleInstallSnapshot failed: %v", err)
+					currentTerm, termErr := sm.storage.GetCurrentTerm()
+					if termErr != nil {
+						log.Fatalf("failed to get current term: %v", termErr)
+					}
+					v.ch <- &konsen.InstallSnapshotResp{Term: currentTerm}
+					continue
+				}
+				v.ch <- resp
+			case installSnapshotRespWrap:
+				if err := sm.handleInstallSnapshotResp(v.resp, v.req, v.server); err != nil {
+					log.Fatalf("handleInstallSnapshotResp failed: %v", err)
+				}
 			default:
 				log.Fatalf("Unrecognized message: %v", v)
 			}
@@ -1061,7 +1507,7 @@ func (sm *StateMachine) handlePut(req *konsen.PutReq, ch chan<- *konsen.PutResp)
 }
 
 func (sm *StateMachine) writeToLogs(data []byte) (*konsen.Log, error) {
-	lastLogIndex, err := sm.storage.LastLogIndex()
+	lastLogIndex, err := sm.effectiveLastLogIndex()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get last log index: %v", err)
 	}
@@ -1189,7 +1635,7 @@ func (sm *StateMachine) handleGetSnapshot() (*Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current term: %v", err)
 	}
-	logs, err := sm.storage.GetLogsFrom(1)
+	logs, err := sm.storage.GetLogsFrom(sm.snapshotIndex + 1)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get logs: %v", err)
 	}
@@ -1220,6 +1666,8 @@ func (sm *StateMachine) handleGetSnapshot() (*Snapshot, error) {
 		LogIndices:    logIndices,
 		LogTerms:      logTerms,
 		LogBytes:      logBytes,
+		SnapshotIndex: sm.snapshotIndex,
+		SnapshotTerm:  sm.snapshotTerm,
 	}, nil
 }
 
@@ -1228,7 +1676,7 @@ func (sm *StateMachine) handleGetStatus() (*StatusSnapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current term: %v", err)
 	}
-	lastLogIndex, err := sm.storage.LastLogIndex()
+	lastLogIndex, err := sm.effectiveLastLogIndex()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get last log index: %v", err)
 	}
@@ -1249,6 +1697,8 @@ func (sm *StateMachine) handleGetStatus() (*StatusSnapshot, error) {
 		NextIndex:     nextIndexMap,
 		MatchIndex:    matchIndexMap,
 		LogCount:      lastLogIndex,
+		SnapshotIndex: sm.snapshotIndex,
+		SnapshotTerm:  sm.snapshotTerm,
 	}, nil
 }
 

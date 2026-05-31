@@ -52,6 +52,13 @@ func (r *RaftGRPCServer) RequestVote(ctx context.Context, req *konsen.RequestVot
 	return r.sm.RequestVote(ctx, req)
 }
 
+func (r *RaftGRPCServer) InstallSnapshot(ctx context.Context, req *konsen.InstallSnapshotReq) (*konsen.InstallSnapshotResp, error) {
+	ctx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+
+	return r.sm.InstallSnapshot(ctx, req)
+}
+
 func (r *RaftGRPCServer) newServer() *grpc.Server {
 	server := grpc.NewServer(
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{

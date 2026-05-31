@@ -13,4 +13,7 @@ type RaftService interface {
 
 	// RequestVote sends RequestVote request to the remote server.
 	RequestVote(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error)
+
+	// InstallSnapshot sends InstallSnapshot request to the remote server (Raft paper Section 7, Figure 13).
+	InstallSnapshot(ctx context.Context, in *konsen.InstallSnapshotReq) (*konsen.InstallSnapshotResp, error)
 }

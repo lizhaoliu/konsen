@@ -298,6 +298,113 @@ func hasPrefix(s, prefix []byte) bool {
 	return true
 }
 
+func (b *BoltDB) GetSnapshotMeta() (uint64, uint64, error) {
+	var index, term uint64
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(statesBucketName)
+		if buf := bkt.Get(snapshotIndexKey); buf != nil {
+			index = bytesToUint64(buf)
+		}
+		if buf := bkt.Get(snapshotTermKey); buf != nil {
+			term = bytesToUint64(buf)
+		}
+		return nil
+	}); err != nil {
+		return 0, 0, err
+	}
+	return index, term, nil
+}
+
+func (b *BoltDB) SetSnapshotMeta(lastIncludedIndex uint64, lastIncludedTerm uint64) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(statesBucketName)
+		if err := bkt.Put(snapshotIndexKey, uint64ToBytes(lastIncludedIndex)); err != nil {
+			return err
+		}
+		return bkt.Put(snapshotTermKey, uint64ToBytes(lastIncludedTerm))
+	})
+}
+
+func (b *BoltDB) DeleteLogsUpTo(maxLogIndex uint64) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		c := tx.Bucket(logsBucketName).Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			if bytesToUint64(k) > maxLogIndex {
+				break
+			}
+			if err := c.Delete(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (b *BoltDB) SnapshotKVData() ([]byte, error) {
+	kvList := &konsen.KVList{}
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(kvBucketName).Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			key := make([]byte, len(k))
+			copy(key, k)
+			val := make([]byte, len(v))
+			copy(val, v)
+			kvList.KvList = append(kvList.KvList, &konsen.KV{Key: key, Value: val})
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return proto.Marshal(kvList)
+}
+
+func (b *BoltDB) RestoreKVData(data []byte) error {
+	kvList := &konsen.KVList{}
+	if err := proto.Unmarshal(data, kvList); err != nil {
+		return err
+	}
+	return b.db.Update(func(tx *bolt.Tx) error {
+		// Clear existing KV data.
+		c := tx.Bucket(kvBucketName).Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			if err := c.Delete(); err != nil {
+				return err
+			}
+		}
+		// Write new KV data.
+		bkt := tx.Bucket(kvBucketName)
+		for _, kv := range kvList.GetKvList() {
+			if err := bkt.Put(kv.GetKey(), kv.GetValue()); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (b *BoltDB) SaveSnapshotFile(data []byte) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(statesBucketName)
+		return bkt.Put(snapshotFileKey, data)
+	})
+}
+
+func (b *BoltDB) LoadSnapshotFile() ([]byte, error) {
+	var result []byte
+	if err := b.db.View(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(statesBucketName)
+		buf := bkt.Get(snapshotFileKey)
+		if buf != nil {
+			result = make([]byte, len(buf))
+			copy(result, buf)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (b *BoltDB) Close() error {
 	return b.db.Close()
 }

@@ -293,6 +293,160 @@ func (b *Badger) ListKeys(prefix []byte, limit int) ([][]byte, error) {
 	return keys, nil
 }
 
+func (b *Badger) GetSnapshotMeta() (uint64, uint64, error) {
+	var index, term uint64
+	if err := b.stateDB.View(func(txn *badger.Txn) error {
+		if item, err := txn.Get(snapshotIndexKey); err == nil {
+			if err := item.Value(func(val []byte) error {
+				index = bytesToUint64(val)
+				return nil
+			}); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		if item, err := txn.Get(snapshotTermKey); err == nil {
+			if err := item.Value(func(val []byte) error {
+				term = bytesToUint64(val)
+				return nil
+			}); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return 0, 0, err
+	}
+	return index, term, nil
+}
+
+func (b *Badger) SetSnapshotMeta(lastIncludedIndex uint64, lastIncludedTerm uint64) error {
+	return b.stateDB.Update(func(txn *badger.Txn) error {
+		if err := txn.Set(snapshotIndexKey, uint64ToBytes(lastIncludedIndex)); err != nil {
+			return err
+		}
+		return txn.Set(snapshotTermKey, uint64ToBytes(lastIncludedTerm))
+	})
+}
+
+func (b *Badger) DeleteLogsUpTo(maxLogIndex uint64) error {
+	return b.logDB.Update(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		var keysToDelete [][]byte
+		for it.Rewind(); it.Valid(); it.Next() {
+			k := it.Item().KeyCopy(nil)
+			if bytesToUint64(k) > maxLogIndex {
+				break
+			}
+			keysToDelete = append(keysToDelete, k)
+		}
+		for _, k := range keysToDelete {
+			if err := txn.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (b *Badger) SnapshotKVData() ([]byte, error) {
+	kvList := &konsen.KVList{}
+	kvPrefix := []byte("kv:")
+	if err := b.stateDB.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = kvPrefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(kvPrefix); it.Valid(); it.Next() {
+			item := it.Item()
+			k := item.Key()
+			// Strip "kv:" prefix.
+			userKey := make([]byte, len(k)-3)
+			copy(userKey, k[3:])
+			if err := item.Value(func(val []byte) error {
+				v := make([]byte, len(val))
+				copy(v, val)
+				kvList.KvList = append(kvList.KvList, &konsen.KV{Key: userKey, Value: v})
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return proto.Marshal(kvList)
+}
+
+func (b *Badger) RestoreKVData(data []byte) error {
+	kvList := &konsen.KVList{}
+	if err := proto.Unmarshal(data, kvList); err != nil {
+		return err
+	}
+	kvPrefix := []byte("kv:")
+
+	// Delete all existing KV entries and write new ones in a single transaction
+	// so a crash never leaves an empty KV state.
+	return b.stateDB.Update(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Prefix = kvPrefix
+		it := txn.NewIterator(opts)
+		var keysToDelete [][]byte
+		for it.Seek(kvPrefix); it.Valid(); it.Next() {
+			keysToDelete = append(keysToDelete, it.Item().KeyCopy(nil))
+		}
+		it.Close()
+		for _, k := range keysToDelete {
+			if err := txn.Delete(k); err != nil {
+				return err
+			}
+		}
+		for _, kv := range kvList.GetKvList() {
+			prefixedKey := make([]byte, 0, 3+len(kv.GetKey()))
+			prefixedKey = append(prefixedKey, kvPrefix...)
+			prefixedKey = append(prefixedKey, kv.GetKey()...)
+			if err := txn.Set(prefixedKey, kv.GetValue()); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (b *Badger) SaveSnapshotFile(data []byte) error {
+	return b.stateDB.Update(func(txn *badger.Txn) error {
+		return txn.Set(snapshotFileKey, data)
+	})
+}
+
+func (b *Badger) LoadSnapshotFile() ([]byte, error) {
+	var result []byte
+	if err := b.stateDB.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(snapshotFileKey)
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			result = make([]byte, len(val))
+			copy(result, val)
+			return nil
+		})
+	}); err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return result, nil
+}
+
 func (b *Badger) Close() error {
 	stateDBErr := b.stateDB.Close()
 	logDBErr := b.logDB.Close()

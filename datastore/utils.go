@@ -3,8 +3,11 @@ package datastore
 import "encoding/binary"
 
 var (
-	currentTermKey = []byte("current_term")
-	votedForKey    = []byte("voted_for")
+	currentTermKey   = []byte("current_term")
+	votedForKey      = []byte("voted_for")
+	snapshotIndexKey = []byte("snapshot_index")
+	snapshotTermKey  = []byte("snapshot_term")
+	snapshotFileKey  = []byte("snapshot_file")
 )
 
 func bytesToUint64(b []byte) uint64 {

@@ -10,11 +10,14 @@ import (
 
 // MemStorage is an in-memory implementation of Storage for testing.
 type MemStorage struct {
-	mu          sync.RWMutex
-	currentTerm uint64
-	votedFor    string
-	logs        map[uint64]*konsen.Log // logIndex -> Log
-	kv          map[string][]byte      // key -> value
+	mu            sync.RWMutex
+	currentTerm   uint64
+	votedFor      string
+	logs          map[uint64]*konsen.Log // logIndex -> Log
+	kv            map[string][]byte      // key -> value
+	snapshotIndex uint64
+	snapshotTerm  uint64
+	snapshotFile  []byte // raw snapshot bytes
 }
 
 func NewMemStorage() *MemStorage {
@@ -189,6 +192,81 @@ func (m *MemStorage) ListKeys(prefix []byte, limit int) ([][]byte, error) {
 	for i, k := range keys {
 		result[i] = []byte(k)
 	}
+	return result, nil
+}
+
+func (m *MemStorage) GetSnapshotMeta() (uint64, uint64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.snapshotIndex, m.snapshotTerm, nil
+}
+
+func (m *MemStorage) SetSnapshotMeta(lastIncludedIndex uint64, lastIncludedTerm uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.snapshotIndex = lastIncludedIndex
+	m.snapshotTerm = lastIncludedTerm
+	return nil
+}
+
+func (m *MemStorage) DeleteLogsUpTo(maxLogIndex uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for idx := range m.logs {
+		if idx <= maxLogIndex {
+			delete(m.logs, idx)
+		}
+	}
+	return nil
+}
+
+func (m *MemStorage) SnapshotKVData() ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	kvList := &konsen.KVList{}
+	for k, v := range m.kv {
+		val := make([]byte, len(v))
+		copy(val, v)
+		kvList.KvList = append(kvList.KvList, &konsen.KV{
+			Key:   []byte(k),
+			Value: val,
+		})
+	}
+	return proto.Marshal(kvList)
+}
+
+func (m *MemStorage) RestoreKVData(data []byte) error {
+	kvList := &konsen.KVList{}
+	if err := proto.Unmarshal(data, kvList); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.kv = make(map[string][]byte)
+	for _, kv := range kvList.GetKvList() {
+		val := make([]byte, len(kv.GetValue()))
+		copy(val, kv.GetValue())
+		m.kv[string(kv.GetKey())] = val
+	}
+	return nil
+}
+
+func (m *MemStorage) SaveSnapshotFile(data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.snapshotFile = make([]byte, len(data))
+	copy(m.snapshotFile, data)
+	return nil
+}
+
+func (m *MemStorage) LoadSnapshotFile() ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.snapshotFile == nil {
+		return nil, nil
+	}
+	result := make([]byte, len(m.snapshotFile))
+	copy(result, m.snapshotFile)
 	return result, nil
 }
 

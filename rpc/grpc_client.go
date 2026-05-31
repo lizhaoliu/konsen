@@ -62,6 +62,10 @@ func (c *peerGRPCClient) RequestVote(ctx context.Context, in *konsen.RequestVote
 	return c.raftClient.RequestVote(ctx, in, grpc.WaitForReady(false))
 }
 
+func (c *peerGRPCClient) InstallSnapshot(ctx context.Context, in *konsen.InstallSnapshotReq) (*konsen.InstallSnapshotResp, error) {
+	return c.raftClient.InstallSnapshot(ctx, in, grpc.WaitForReady(false))
+}
+
 // KVService implementation.
 
 func (c *peerGRPCClient) Put(ctx context.Context, in *konsen.PutReq) (*konsen.PutResp, error) {
