@@ -130,6 +130,14 @@ func (c *inProcessClient) Get(ctx context.Context, in *konsen.GetReq) (*konsen.G
 	return &konsen.GetResp{Success: true, Value: val}, nil
 }
 
+func (c *inProcessClient) InstallSnapshot(ctx context.Context, in *konsen.InstallSnapshotReq) (*konsen.InstallSnapshotResp, error) {
+	target, err := c.simulateNetwork(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return target.InstallSnapshot(ctx, in)
+}
+
 // testCluster manages an in-process Raft cluster for integration testing.
 type testCluster struct {
 	t       *testing.T

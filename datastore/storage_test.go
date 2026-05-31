@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	konsen "github.com/lizhaoliu/konsen/v2/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // storageFactory creates a new Storage instance for testing and returns a cleanup function.
@@ -461,6 +462,237 @@ func TestClose(t *testing.T) {
 			s, _ := tc.factory(t)
 			if err := s.Close(); err != nil {
 				t.Errorf("Close: %v", err)
+			}
+		})
+	}
+}
+
+func TestSnapshotMeta(t *testing.T) {
+	for _, tc := range allFactories() {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cleanup := tc.factory(t)
+			defer cleanup()
+
+			// Initial snapshot meta should be (0, 0).
+			idx, term, err := s.GetSnapshotMeta()
+			if err != nil {
+				t.Fatalf("GetSnapshotMeta: %v", err)
+			}
+			if idx != 0 || term != 0 {
+				t.Errorf("initial snapshot meta = (%d, %d), want (0, 0)", idx, term)
+			}
+
+			// Set and get.
+			if err := s.SetSnapshotMeta(10, 3); err != nil {
+				t.Fatalf("SetSnapshotMeta: %v", err)
+			}
+			idx, term, err = s.GetSnapshotMeta()
+			if err != nil {
+				t.Fatalf("GetSnapshotMeta: %v", err)
+			}
+			if idx != 10 || term != 3 {
+				t.Errorf("snapshot meta = (%d, %d), want (10, 3)", idx, term)
+			}
+
+			// Overwrite.
+			if err := s.SetSnapshotMeta(50, 7); err != nil {
+				t.Fatalf("SetSnapshotMeta: %v", err)
+			}
+			idx, term, err = s.GetSnapshotMeta()
+			if err != nil {
+				t.Fatalf("GetSnapshotMeta: %v", err)
+			}
+			if idx != 50 || term != 7 {
+				t.Errorf("snapshot meta = (%d, %d), want (50, 7)", idx, term)
+			}
+		})
+	}
+}
+
+func TestDeleteLogsUpTo(t *testing.T) {
+	for _, tc := range allFactories() {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cleanup := tc.factory(t)
+			defer cleanup()
+
+			s.WriteLogs([]*konsen.Log{
+				{Index: 1, Term: 1, Data: []byte("a")},
+				{Index: 2, Term: 1, Data: []byte("b")},
+				{Index: 3, Term: 2, Data: []byte("c")},
+				{Index: 4, Term: 2, Data: []byte("d")},
+				{Index: 5, Term: 3, Data: []byte("e")},
+			})
+
+			// Delete logs up to index 3.
+			if err := s.DeleteLogsUpTo(3); err != nil {
+				t.Fatalf("DeleteLogsUpTo(3): %v", err)
+			}
+
+			// Logs 1-3 should be gone.
+			for i := uint64(1); i <= 3; i++ {
+				log, err := s.GetLog(i)
+				if err != nil {
+					t.Fatalf("GetLog(%d): %v", i, err)
+				}
+				if log != nil {
+					t.Errorf("GetLog(%d) should be nil after DeleteLogsUpTo(3)", i)
+				}
+			}
+
+			// Logs 4-5 should remain.
+			for i := uint64(4); i <= 5; i++ {
+				log, err := s.GetLog(i)
+				if err != nil {
+					t.Fatalf("GetLog(%d): %v", i, err)
+				}
+				if log == nil {
+					t.Errorf("GetLog(%d) should not be nil after DeleteLogsUpTo(3)", i)
+				}
+			}
+
+			// LastLogIndex should still be 5.
+			idx, _ := s.LastLogIndex()
+			if idx != 5 {
+				t.Errorf("LastLogIndex = %d, want 5", idx)
+			}
+		})
+	}
+}
+
+func TestSnapshotKVData(t *testing.T) {
+	for _, tc := range allFactories() {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cleanup := tc.factory(t)
+			defer cleanup()
+
+			// Write some KV pairs.
+			s.SetValue([]byte("key1"), []byte("val1"))
+			s.SetValue([]byte("key2"), []byte("val2"))
+			s.SetValue([]byte("key3"), []byte("val3"))
+
+			// Snapshot.
+			data, err := s.SnapshotKVData()
+			if err != nil {
+				t.Fatalf("SnapshotKVData: %v", err)
+			}
+			if len(data) == 0 {
+				t.Fatal("SnapshotKVData returned empty data")
+			}
+
+			// Unmarshal and verify.
+			kvList := &konsen.KVList{}
+			if err := proto.Unmarshal(data, kvList); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if len(kvList.GetKvList()) != 3 {
+				t.Errorf("snapshot contains %d KV pairs, want 3", len(kvList.GetKvList()))
+			}
+
+			// Build a map for verification.
+			kvMap := make(map[string]string)
+			for _, kv := range kvList.GetKvList() {
+				kvMap[string(kv.GetKey())] = string(kv.GetValue())
+			}
+			for _, k := range []string{"key1", "key2", "key3"} {
+				expected := "val" + k[len(k)-1:]
+				if kvMap[k] != expected {
+					t.Errorf("snapshot[%s] = %q, want %q", k, kvMap[k], expected)
+				}
+			}
+		})
+	}
+}
+
+func TestRestoreKVData(t *testing.T) {
+	for _, tc := range allFactories() {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cleanup := tc.factory(t)
+			defer cleanup()
+
+			// Write initial KV data.
+			s.SetValue([]byte("old1"), []byte("oldval1"))
+			s.SetValue([]byte("old2"), []byte("oldval2"))
+
+			// Prepare new KV data.
+			newKVList := &konsen.KVList{
+				KvList: []*konsen.KV{
+					{Key: []byte("new1"), Value: []byte("newval1")},
+					{Key: []byte("new2"), Value: []byte("newval2")},
+				},
+			}
+			data, err := proto.Marshal(newKVList)
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+
+			// Restore.
+			if err := s.RestoreKVData(data); err != nil {
+				t.Fatalf("RestoreKVData: %v", err)
+			}
+
+			// Old keys should be gone.
+			for _, k := range []string{"old1", "old2"} {
+				v, err := s.GetValue([]byte(k))
+				if err != nil {
+					t.Fatalf("GetValue(%s): %v", k, err)
+				}
+				if v != nil {
+					t.Errorf("GetValue(%s) = %q, want nil after restore", k, v)
+				}
+			}
+
+			// New keys should exist.
+			v, _ := s.GetValue([]byte("new1"))
+			if string(v) != "newval1" {
+				t.Errorf("GetValue(new1) = %q, want %q", v, "newval1")
+			}
+			v, _ = s.GetValue([]byte("new2"))
+			if string(v) != "newval2" {
+				t.Errorf("GetValue(new2) = %q, want %q", v, "newval2")
+			}
+		})
+	}
+}
+
+func TestSnapshotFile(t *testing.T) {
+	for _, tc := range allFactories() {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cleanup := tc.factory(t)
+			defer cleanup()
+
+			// Initially no snapshot file.
+			data, err := s.LoadSnapshotFile()
+			if err != nil {
+				t.Fatalf("LoadSnapshotFile: %v", err)
+			}
+			if data != nil {
+				t.Errorf("initial LoadSnapshotFile = %v, want nil", data)
+			}
+
+			// Save and load.
+			payload := []byte("snapshot-content-here")
+			if err := s.SaveSnapshotFile(payload); err != nil {
+				t.Fatalf("SaveSnapshotFile: %v", err)
+			}
+			data, err = s.LoadSnapshotFile()
+			if err != nil {
+				t.Fatalf("LoadSnapshotFile: %v", err)
+			}
+			if string(data) != string(payload) {
+				t.Errorf("LoadSnapshotFile = %q, want %q", data, payload)
+			}
+
+			// Overwrite.
+			payload2 := []byte("updated-snapshot")
+			if err := s.SaveSnapshotFile(payload2); err != nil {
+				t.Fatalf("SaveSnapshotFile: %v", err)
+			}
+			data, err = s.LoadSnapshotFile()
+			if err != nil {
+				t.Fatalf("LoadSnapshotFile: %v", err)
+			}
+			if string(data) != string(payload2) {
+				t.Errorf("LoadSnapshotFile after overwrite = %q, want %q", data, payload2)
 			}
 		})
 	}

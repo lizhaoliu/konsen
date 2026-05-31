@@ -199,6 +199,55 @@ func (f *faultyStorage) ListKeys(prefix []byte, limit int) ([][]byte, error) {
 	return f.inner.ListKeys(prefix, limit)
 }
 
+func (f *faultyStorage) GetSnapshotMeta() (uint64, uint64, error) {
+	if err := f.maybeFault("GetSnapshotMeta"); err != nil {
+		return 0, 0, err
+	}
+	return f.inner.GetSnapshotMeta()
+}
+
+func (f *faultyStorage) SetSnapshotMeta(lastIncludedIndex uint64, lastIncludedTerm uint64) error {
+	if err := f.maybeFault("SetSnapshotMeta"); err != nil {
+		return err
+	}
+	return f.inner.SetSnapshotMeta(lastIncludedIndex, lastIncludedTerm)
+}
+
+func (f *faultyStorage) DeleteLogsUpTo(maxLogIndex uint64) error {
+	if err := f.maybeFault("DeleteLogsUpTo"); err != nil {
+		return err
+	}
+	return f.inner.DeleteLogsUpTo(maxLogIndex)
+}
+
+func (f *faultyStorage) SnapshotKVData() ([]byte, error) {
+	if err := f.maybeFault("SnapshotKVData"); err != nil {
+		return nil, err
+	}
+	return f.inner.SnapshotKVData()
+}
+
+func (f *faultyStorage) RestoreKVData(data []byte) error {
+	if err := f.maybeFault("RestoreKVData"); err != nil {
+		return err
+	}
+	return f.inner.RestoreKVData(data)
+}
+
+func (f *faultyStorage) SaveSnapshotFile(data []byte) error {
+	if err := f.maybeFault("SaveSnapshotFile"); err != nil {
+		return err
+	}
+	return f.inner.SaveSnapshotFile(data)
+}
+
+func (f *faultyStorage) LoadSnapshotFile() ([]byte, error) {
+	if err := f.maybeFault("LoadSnapshotFile"); err != nil {
+		return nil, err
+	}
+	return f.inner.LoadSnapshotFile()
+}
+
 func (f *faultyStorage) Close() error {
 	return f.inner.Close()
 }

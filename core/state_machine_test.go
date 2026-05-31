@@ -16,11 +16,13 @@ import (
 type mockRaftService struct {
 	mu sync.Mutex
 
-	appendEntriesFunc func(ctx context.Context, in *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error)
-	requestVoteFunc   func(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error)
+	appendEntriesFunc   func(ctx context.Context, in *konsen.AppendEntriesReq) (*konsen.AppendEntriesResp, error)
+	requestVoteFunc     func(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error)
+	installSnapshotFunc func(ctx context.Context, in *konsen.InstallSnapshotReq) (*konsen.InstallSnapshotResp, error)
 
-	appendEntriesCalls []*konsen.AppendEntriesReq
-	requestVoteCalls   []*konsen.RequestVoteReq
+	appendEntriesCalls   []*konsen.AppendEntriesReq
+	requestVoteCalls     []*konsen.RequestVoteReq
+	installSnapshotCalls []*konsen.InstallSnapshotReq
 }
 
 func newMockRaftService() *mockRaftService {
@@ -30,6 +32,9 @@ func newMockRaftService() *mockRaftService {
 		},
 		requestVoteFunc: func(ctx context.Context, in *konsen.RequestVoteReq) (*konsen.RequestVoteResp, error) {
 			return &konsen.RequestVoteResp{Term: in.GetTerm(), VoteGranted: true}, nil
+		},
+		installSnapshotFunc: func(ctx context.Context, in *konsen.InstallSnapshotReq) (*konsen.InstallSnapshotResp, error) {
+			return &konsen.InstallSnapshotResp{Term: in.GetTerm()}, nil
 		},
 	}
 }
@@ -46,6 +51,14 @@ func (m *mockRaftService) RequestVote(ctx context.Context, in *konsen.RequestVot
 	m.mu.Lock()
 	m.requestVoteCalls = append(m.requestVoteCalls, in)
 	fn := m.requestVoteFunc
+	m.mu.Unlock()
+	return fn(ctx, in)
+}
+
+func (m *mockRaftService) InstallSnapshot(ctx context.Context, in *konsen.InstallSnapshotReq) (*konsen.InstallSnapshotResp, error) {
+	m.mu.Lock()
+	m.installSnapshotCalls = append(m.installSnapshotCalls, in)
+	fn := m.installSnapshotFunc
 	m.mu.Unlock()
 	return fn(ctx, in)
 }

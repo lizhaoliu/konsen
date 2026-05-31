@@ -46,6 +46,31 @@ type Storage interface {
 	// DeleteLogsFrom deletes logs with index greater equal than given index.
 	DeleteLogsFrom(minLogIndex uint64) error
 
+	// Snapshot methods required by Raft log compaction (Section 7).
+
+	// GetSnapshotMeta returns the lastIncludedIndex and lastIncludedTerm of the most recent snapshot.
+	// Returns (0, 0, nil) if no snapshot exists.
+	GetSnapshotMeta() (lastIncludedIndex uint64, lastIncludedTerm uint64, err error)
+
+	// SetSnapshotMeta atomically persists the snapshot metadata.
+	SetSnapshotMeta(lastIncludedIndex uint64, lastIncludedTerm uint64) error
+
+	// DeleteLogsUpTo deletes all log entries with index <= maxLogIndex.
+	DeleteLogsUpTo(maxLogIndex uint64) error
+
+	// SnapshotKVData serializes all KV pairs into a KVList protobuf for sending in InstallSnapshot.
+	SnapshotKVData() ([]byte, error)
+
+	// RestoreKVData replaces the entire KV state from a serialized KVList protobuf.
+	// This clears all existing KV data before writing the new state.
+	RestoreKVData(data []byte) error
+
+	// SaveSnapshotFile writes raw snapshot bytes to persistent storage.
+	SaveSnapshotFile(data []byte) error
+
+	// LoadSnapshotFile reads snapshot file bytes. Returns nil, nil if no snapshot file exists.
+	LoadSnapshotFile() ([]byte, error)
+
 	// Following methods are not required by Raft.
 
 	// SetValue stores a key-value pair.

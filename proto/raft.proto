@@ -42,10 +42,29 @@ message RequestVoteResp {
   bool vote_granted = 2;  // True means candidate received vote.
 }
 
+// InstallSnapshot RPC (Raft paper Figure 13).
+// Invoked by leader to send chunks of a snapshot to a follower.
+message InstallSnapshotReq {
+  uint64 term = 1;                  // Leader's term.
+  string leader_id = 2;             // So follower can redirect clients.
+  uint64 last_included_index = 3;   // The snapshot replaces all entries up through and including this index.
+  uint64 last_included_term = 4;    // Term of lastIncludedIndex entry.
+  uint64 offset = 5;                // Byte offset where chunk is positioned in the snapshot file.
+  bytes data = 6;                   // Raw bytes of the snapshot chunk, starting at offset.
+  bool done = 7;                    // True if this is the last chunk.
+}
+
+message InstallSnapshotResp {
+  uint64 term = 1;  // Current term, for leader to update itself.
+}
+
 service Raft {
   // Sends "AppendEntries" request.
   rpc AppendEntries(AppendEntriesReq) returns (AppendEntriesResp) {}
 
   // Sends "RequestVote" request.
   rpc RequestVote(RequestVoteReq) returns (RequestVoteResp) {}
+
+  // Sends "InstallSnapshot" request (Raft paper Section 7, Figure 13).
+  rpc InstallSnapshot(InstallSnapshotReq) returns (InstallSnapshotResp) {}
 }
