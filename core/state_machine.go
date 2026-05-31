@@ -788,6 +788,9 @@ func (sm *StateMachine) sendAppendEntries(ctx context.Context) error {
 		if server != sm.cluster.LocalServerName {
 			// If the follower needs entries that have been compacted,
 			// send InstallSnapshot instead of AppendEntries (Raft paper Section 7).
+			// While a transfer is in flight we skip AppendEntries for this follower; the
+			// InstallSnapshot chunks themselves act as leader contact and reset the
+			// follower's election timer.
 			if sm.nextIndex[server] <= sm.snapshotIndex {
 				if !sm.snapshotInFlight[server] {
 					sm.snapshotInFlight[server] = true
@@ -1021,6 +1024,13 @@ func (sm *StateMachine) sendInstallSnapshot(ctx context.Context, server string, 
 				return
 			}
 
+			// If the follower reports a higher term, the leader is stale -- stop sending
+			// the remaining chunks and route the response back so the leader steps down.
+			if resp.GetTerm() > term {
+				notify(resp, req)
+				return
+			}
+
 			// If not the final chunk, just advance offset and send the next chunk.
 			if !done {
 				offset = end
@@ -1065,6 +1075,12 @@ func (sm *StateMachine) handleInstallSnapshot(req *konsen.InstallSnapshotReq) (*
 	}
 
 	// Valid leader -- reset election timer, record leader.
+	// Per Raft paper Section 5.2: if a candidate receives a valid RPC from a leader with a term
+	// at least as large as its own, it recognizes the leader as legitimate and steps down.
+	if sm.getRole() == konsen.Role_CANDIDATE {
+		sm.setRole(konsen.Role_FOLLOWER)
+		sm.numVotes = 0
+	}
 	sm.resetElectionTimer()
 	sm.currentLeader = req.GetLeaderId()
 
@@ -1085,7 +1101,10 @@ func (sm *StateMachine) handleInstallSnapshot(req *konsen.InstallSnapshotReq) (*
 	// 3. Write data into snapshot file at given offset.
 	offset := int(req.GetOffset())
 	if offset != len(sm.pendingSnapshot.data) {
-		// Offset mismatch -- discard pending snapshot and let leader retry.
+		// Offset mismatch -- discard pending snapshot and let leader retry. With in-order
+		// sequential unary chunks this is unreachable; if it ever fires (a dropped or
+		// reordered chunk), the leader's next AppendEntries probe reconciles via a
+		// prevLogTerm mismatch, so no stale snapshot is silently accepted.
 		sm.pendingSnapshot = nil
 		return &konsen.InstallSnapshotResp{Term: currentTerm}, nil
 	}
